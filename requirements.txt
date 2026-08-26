@@ -8,3 +8,4 @@ Pillow>=10.3.0
 pyheif==0.7.1
 requests==2.31.0
 chardet==5.2.0
+Flask>=2.0.0
