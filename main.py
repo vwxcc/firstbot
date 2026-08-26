@@ -1,6 +1,5 @@
 import os
 import telebot
-import time
 
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
@@ -8,16 +7,19 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 
-# Обработчик команды /start
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.send_message(message.chat.id, "Привет! Я бот на Render (Long Polling)! 🚀")
+# Единый обработчик для всех текстовых сообщений
+@bot.message_handler(content_types=['text'])
+def handle_all_messages(message):
+    text = message.text.strip()  # убираем лишние пробелы и переводы строк
+    
+    if text == '/start':
+        bot.send_message(message.chat.id, "Привет! Я бот на Render (Long Polling)! 🚀")
+    else:
+        # На любое другое сообщение отвечаем эхом
+        bot.reply_to(message, f"Я получил: {text}")
 
-# Обработчик любого другого текста
-@bot.message_handler(func=lambda message: True)
-def echo(message):
-    bot.reply_to(message, f"Я получил: {message.text}")
+# Удаляем вебхук на случай, если он ещё активен
+bot.remove_webhook()
 
 print("Бот запущен, режим Long Polling...")
-# Бесконечный цикл опроса
 bot.infinity_polling()
