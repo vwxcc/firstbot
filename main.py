@@ -10,7 +10,7 @@ app = Flask(__name__)
 def start(message):
     bot.send_message(message.chat.id, "Привет! Я бот на Render! 🚀")
 
-@app.route('/' + TOKEN, methods=['POST'])
+@app.route('/webhook', methods=['POST'])
 def webhook():
     json_str = request.stream.read().decode("utf-8")
     update = telebot.types.Update.de_json(json_str)
