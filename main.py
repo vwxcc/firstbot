@@ -25,12 +25,15 @@ client = InferenceClient(token=HF_TOKEN)
 def generate_text_response(prompt: str, max_len=500) -> str:
     try:
         messages = [{"role": "user", "content": prompt}]
-        completion = client.chat_completion(
-            model="google/gemma-2-2b-it",
+        # Используем совместимый с OpenAI метод
+        response = client.chat.completions.create(
+            model="google/gemma-2-2b-it",  # Модель нужно указать здесь
             messages=messages,
-            max_tokens=max_len
+            max_tokens=max_len,
+            temperature=0.7
         )
-        return completion.choices[0].message.content
+        # Ответ приходит в виде объекта, как в OpenAI
+        return response.choices[0].message.content
     except Exception as e:
         return f"Ошибка при генерации текста: {e}"
 
