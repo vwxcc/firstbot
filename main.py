@@ -13,34 +13,35 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")  # опционально
 
 if not TOKEN:
-    raise ValueError("BOT_TOKEN не задан!")
+    raise ValueError("BOT_TOKEN не задан")
 if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY не задан!")
+    raise ValueError("GROQ_API_KEY не задан")
 
 # ---------- Инициализация клиентов ----------
 bot = telebot.TeleBot(TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # Инициализация Gemini, если ключ есть
+gemini_model = None
 if GOOGLE_API_KEY:
     try:
         import google.generativeai as genai
         genai.configure(api_key=GOOGLE_API_KEY)
         gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-        print("✅ Google Gemini инициализирован для фото.")
+        print("Gemini инициализирован для фото")
     except Exception as e:
-        print(f"⚠️ Ошибка инициализации Gemini: {e}")
-        gemini_model = None
+        print(f"Ошибка инициализации Gemini: {e}")
 else:
-    gemini_model = None
-    print("ℹ️ GOOGLE_API_KEY не задан, функция описания фото отключена.")
+    print("GOOGLE_API_KEY не задан, функция описания фото отключена")
 
 # ---------- Хранилище истории ----------
 conversation_histories = defaultdict(list)
 MAX_MESSAGES = 12
 MAX_CONTENT_LENGTH = 2000
 
-# ---------- Функции для работы с историей ----------
+# ---------- Системный промпт для всех запросов к Groq ----------
+SYSTEM_PROMPT = "Ты — полезный помощник. Отвечай всегда на русском языке. Будь кратким и по делу, без лишней воды."
+
 def get_history(chat_id):
     return conversation_histories[chat_id]
 
@@ -52,7 +53,7 @@ def compress_history(chat_id):
     try:
         completion = groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "Сделай краткую суммаризацию диалога, выдели ключевые темы и важные детали."},
+                {"role": "system", "content": SYSTEM_PROMPT + " Сделай краткую суммаризацию диалога, выдели ключевые темы и важные детали."},
                 {"role": "user", "content": f"Диалог:\n{dialog_text}"}
             ],
             model="llama-3.1-8b-instant",
@@ -64,7 +65,7 @@ def compress_history(chat_id):
             {"role": "assistant", "content": f"Краткое содержание предыдущего диалога:\n{summary}"}
         ]
     except Exception as e:
-        print(f"⚠️ Ошибка сжатия: {e}")
+        print(f"Ошибка сжатия: {e}")
         if len(history) > 6:
             conversation_histories[chat_id] = history[-6:]
 
@@ -82,7 +83,7 @@ def generate_response_with_history(chat_id, user_message):
         history = get_history(chat_id)
         history.append({"role": "user", "content": user_message})
 
-    messages = history.copy()
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history.copy()
     try:
         completion = groq_client.chat.completions.create(
             messages=messages,
@@ -92,25 +93,33 @@ def generate_response_with_history(chat_id, user_message):
         )
         assistant_reply = completion.choices[0].message.content
     except Exception as e:
-        assistant_reply = f"❌ Ошибка генерации: {e}"
+        print(f"Ошибка генерации: {e}")
+        assistant_reply = None
+
+    if assistant_reply is None:
+        assistant_reply = "Произошла ошибка при обработке запроса. Попробуйте позже."
+        # Не добавляем ошибку в историю, чтобы не засорять
+        history.pop()  # убираем последнее сообщение пользователя, т.к. ответ не удался
+        return assistant_reply
 
     history.append({"role": "assistant", "content": assistant_reply})
     conversation_histories[chat_id] = history
     return assistant_reply
 
-# ---------- Функция описания фото (если доступен Gemini) ----------
+# ---------- Функция описания фото через Gemini ----------
 def describe_image(image_path: str) -> str:
     if gemini_model is None:
-        return "⚠️ Функция описания фото временно недоступна. Добавьте GOOGLE_API_KEY в настройки."
+        return "Функция описания фото временно недоступна (не задан ключ Google API)."
     try:
         with open(image_path, "rb") as f:
             image_data = f.read()
         response = gemini_model.generate_content(
-            ["Опиши кратко, что изображено на этом фото.", {"mime_type": "image/jpeg", "data": image_data}]
+            ["Опиши кратко, что изображено на этом фото, на русском языке.", {"mime_type": "image/jpeg", "data": image_data}]
         )
         return response.text if response.text else "Не удалось описать изображение."
     except Exception as e:
-        return f"❌ Ошибка описания фото: {e}"
+        print(f"Ошибка описания фото: {e}")
+        return "Произошла ошибка при обработке фото. Попробуйте позже."
 
 # ---------- Функция транскрипции аудио через Groq Whisper ----------
 def transcribe_audio(audio_path: str) -> str:
@@ -126,20 +135,20 @@ def transcribe_audio(audio_path: str) -> str:
         if response.status_code == 200:
             return response.text.strip()
         else:
-            return f"Ошибка транскрипции: {response.text}"
+            print(f"Ошибка транскрипции: {response.text}")
+            return "Не удалось распознать аудио."
     except Exception as e:
-        return f"❌ Ошибка: {e}"
+        print(f"Ошибка транскрипции: {e}")
+        return "Произошла ошибка при обработке аудио."
 
 # ---------- Обработчики ----------
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.send_message(message.chat.id,
-        "🚀 Привет! Я бот **Fast Answer**.\n"
-        "📝 Отправь текст, фото, аудио или документ.\n"
-        "🔹 Текст → Groq (быстро)\n"
-        "🔹 Фото → " + ("Google Gemini" if gemini_model else "отключено (нужен ключ)") + "\n"
-        "🔹 Аудио → Groq Whisper\n"
-        "💬 Я запоминаю историю и сжимаю длинные диалоги.")
+        "Привет! Я бот Fast Answer.\n"
+        "Отправьте текст, фото, аудио или документ.\n"
+        "Текст обрабатывается через Groq, фото через Google Gemini (если ключ задан), аудио через Whisper.\n"
+        "Я запоминаю историю диалога и автоматически сжимаю длинные разговоры.")
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
@@ -163,9 +172,10 @@ def handle_photo(message):
             tmp_path = tmp.name
         bot.send_chat_action(message.chat.id, "typing")
         description = describe_image(tmp_path)
-        bot.reply_to(message, f"📸 {description}")
+        bot.reply_to(message, description)
     except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
+        print(f"Ошибка обработки фото: {e}")
+        bot.reply_to(message, "Произошла ошибка при обработке фото.")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -187,30 +197,30 @@ def handle_document(message):
             jpeg_path = file_parser.parse_heic(tmp_path)
             if isinstance(jpeg_path, str) and jpeg_path.endswith('.jpg'):
                 description = describe_image(jpeg_path)
-                bot.reply_to(message, f"🖼️ (HEIC) {description}")
+                bot.reply_to(message, description)
                 os.unlink(jpeg_path)
             else:
-                bot.reply_to(message, f"⚠️ Ошибка HEIC: {jpeg_path}")
+                bot.reply_to(message, "Не удалось обработать HEIC-файл.")
             return
 
         extracted_text = file_parser.parse_file(tmp_path, extension)
         if not extracted_text:
-            bot.reply_to(message, "📄 В документе нет текста.")
+            bot.reply_to(message, "В документе нет текста для обработки.")
             return
         if len(extracted_text) > 3000:
-            extracted_text = extracted_text[:3000] + "\n... (обрезано)"
+            extracted_text = extracted_text[:3000] + "\n... (текст обрезан)"
 
         bot.send_chat_action(message.chat.id, "typing")
-        prompt = f"Содержание документа:\n{extracted_text}\n\nДай краткий ответ."
+        prompt = f"Содержание документа:\n{extracted_text}\n\nДай краткий ответ по этому содержанию."
         chat_id = message.chat.id
         answer = generate_response_with_history(chat_id, prompt)
-        bot.reply_to(message, f"📄 Ответ:\n{answer}")
+        bot.reply_to(message, answer)
 
     except file_parser.ParseError as e:
-        bot.reply_to(message, f"⚠️ Ошибка парсинга: {e}")
+        bot.reply_to(message, f"Ошибка парсинга файла: {e}")
     except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
-        traceback.print_exc()
+        print(f"Ошибка обработки документа: {e}")
+        bot.reply_to(message, "Произошла ошибка при обработке документа.")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -233,44 +243,54 @@ def handle_audio(message):
 
         bot.send_chat_action(message.chat.id, "typing")
         transcript = transcribe_audio(tmp_path)
-        if transcript.startswith("Ошибка") or transcript.startswith("❌"):
-            bot.reply_to(message, f"🎤 {transcript}")
+        if "ошибка" in transcript.lower() or "не удалось" in transcript.lower():
+            bot.reply_to(message, transcript)
             return
-        bot.reply_to(message, f"🎤 Распознано:\n{transcript}")
+        bot.reply_to(message, f"Распознанный текст:\n{transcript}")
         chat_id = message.chat.id
         answer = generate_response_with_history(chat_id, f"Вопрос по аудио: {transcript}")
-        bot.send_message(message.chat.id, f"💬 {answer}")
+        bot.send_message(message.chat.id, answer)
 
     except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
+        print(f"Ошибка обработки аудио: {e}")
+        bot.reply_to(message, "Произошла ошибка при обработке аудио.")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
 @bot.message_handler(content_types=['video'])
 def handle_video(message):
-    bot.reply_to(message, "🎬 Видео пока не поддерживается.")
+    bot.reply_to(message, "Видео пока не поддерживаются.")
 
 @bot.message_handler(content_types=['sticker', 'contact', 'location', 'venue', 'animation', 'video_note'])
 def handle_other(message):
-    bot.reply_to(message, "Извините, я не умею обрабатывать этот тип.")
+    bot.reply_to(message, "Извините, я не умею обрабатывать этот тип контента.")
 
 # ---------- Запуск с повторными попытками при конфликте ----------
 def start_bot():
-    bot.remove_webhook()
-    print("🚀 Бот Fast Answer запущен (Long Polling)...")
-    print("🤖 Текст → Groq | 📸 → " + ("Gemini" if gemini_model else "отключено") + " | 🎤 → Groq Whisper")
+    # Принудительно удаляем вебхук, чтобы избежать конфликта
+    try:
+        bot.remove_webhook()
+        print("Вебхук удалён")
+    except Exception as e:
+        print(f"Ошибка удаления вебхука: {e}")
+    time.sleep(2)
+
+    print("Бот Fast Answer запущен (Long Polling)...")
+    print("Текст -> Groq, Фото -> " + ("Gemini" if gemini_model else "отключено") + ", Аудио -> Groq Whisper")
+
     while True:
         try:
             bot.infinity_polling(timeout=60, long_polling_timeout=30)
         except Exception as e:
-            print(f"❌ Ошибка polling: {e}")
+            print(f"Ошибка polling: {e}")
             if "409" in str(e):
-                print("⚠️ Конфликт (409), повтор через 10 секунд...")
+                print("Конфликт (409), повтор через 10 секунд...")
                 time.sleep(10)
                 continue
             else:
-                raise
+                print("Неизвестная ошибка, перезапуск через 30 секунд...")
+                time.sleep(30)
 
 if __name__ == '__main__':
     start_bot()
