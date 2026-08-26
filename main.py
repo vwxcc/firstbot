@@ -3,9 +3,11 @@ import telebot
 import tempfile
 import traceback
 import time
+import threading
 from groq import Groq
 import file_parser
 from collections import defaultdict
+from flask import Flask, request
 
 # ---------- Переменные окружения ----------
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -20,6 +22,7 @@ if not GROQ_API_KEY:
 # ---------- Инициализация клиентов ----------
 bot = telebot.TeleBot(TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
+app = Flask(__name__)  # для HTTP-сервера
 
 # Инициализация Gemini, если ключ есть
 gemini_model = None
@@ -39,7 +42,7 @@ conversation_histories = defaultdict(list)
 MAX_MESSAGES = 12
 MAX_CONTENT_LENGTH = 2000
 
-# ---------- Системный промпт для всех запросов к Groq ----------
+# ---------- Системный промпт ----------
 SYSTEM_PROMPT = "Ты — полезный помощник. Отвечай всегда на русском языке. Будь кратким и по делу, без лишней воды."
 
 def get_history(chat_id):
@@ -98,8 +101,7 @@ def generate_response_with_history(chat_id, user_message):
 
     if assistant_reply is None:
         assistant_reply = "Произошла ошибка при обработке запроса. Попробуйте позже."
-        # Не добавляем ошибку в историю, чтобы не засорять
-        history.pop()  # убираем последнее сообщение пользователя, т.к. ответ не удался
+        history.pop()
         return assistant_reply
 
     history.append({"role": "assistant", "content": assistant_reply})
@@ -141,7 +143,7 @@ def transcribe_audio(audio_path: str) -> str:
         print(f"Ошибка транскрипции: {e}")
         return "Произошла ошибка при обработке аудио."
 
-# ---------- Обработчики ----------
+# ---------- Обработчики Telegram ----------
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.send_message(message.chat.id,
@@ -266,9 +268,23 @@ def handle_video(message):
 def handle_other(message):
     bot.reply_to(message, "Извините, я не умею обрабатывать этот тип контента.")
 
-# ---------- Запуск с повторными попытками при конфликте ----------
+# ---------- HTTP-сервер для поддержки порта ----------
+@app.route('/')
+def health():
+    return "OK", 200
+
+@app.route('/health')
+def health_check():
+    return "OK", 200
+
+def run_flask():
+    # Получаем порт из переменной окружения Render (по умолчанию 10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+# ---------- Запуск бота и HTTP-сервера ----------
 def start_bot():
-    # Принудительно удаляем вебхук, чтобы избежать конфликта
+    # Удаляем вебхук, чтобы избежать конфликта
     try:
         bot.remove_webhook()
         print("Вебхук удалён")
@@ -279,6 +295,12 @@ def start_bot():
     print("Бот Fast Answer запущен (Long Polling)...")
     print("Текст -> Groq, Фото -> " + ("Gemini" if gemini_model else "отключено") + ", Аудио -> Groq Whisper")
 
+    # Запускаем Flask-сервер в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print("HTTP-сервер для проверки порта запущен")
+
+    # Запускаем бота
     while True:
         try:
             bot.infinity_polling(timeout=60, long_polling_timeout=30)
