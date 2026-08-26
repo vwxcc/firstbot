@@ -38,25 +38,24 @@ AUDIO_MODEL = "openai/whisper-large-v3"
 
 # ------------------- Функции с переключением моделей -------------------
 
-def generate_text_with_fallback(prompt: str, max_len=500) -> str:
-    """Генерирует текст, перебирая модели при ошибках."""
-    last_error = None
-    for model in TEXT_MODELS:
-        try:
-            print(f"🔄 Пробую модель: {model}")
-            messages = [{"role": "user", "content": prompt}]
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_len,
-                temperature=0.7
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"❌ Модель {model} не сработала: {e}")
-            last_error = e
-            continue
-    return f"⚠️ Все модели временно недоступны. Ошибка: {last_error}"
+import os
+from groq import Groq
+
+# Инициализация клиента Groq
+groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+def generate_text_response(prompt: str, max_len=500) -> str:
+    try:
+        # Используем модель Gemma-2 9b (быстрая и качественная)
+        chat_completion = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="gemma2-9b-it",  # можно также "mixtral-8x7b-32768" или "llama3-8b-8192"
+            max_tokens=max_len,
+            temperature=0.7,
+        )
+        return chat_completion.choices[0].message.content
+    except Exception as e:
+        return f"Ошибка при генерации текста: {e}"
 
 def describe_image_with_fallback(image_path: str) -> str:
     """Описывает изображение с перебором моделей."""
