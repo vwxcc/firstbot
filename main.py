@@ -38,6 +38,21 @@ if GOOGLE_API_KEY:
 else:
     print("GOOGLE_API_KEY не задан, функция описания фото отключена")
 
+# ---------- Проверка Groq API ----------
+try:
+    test_completion = groq_client.chat.completions.create(
+        messages=[{"role": "user", "content": "test"}],
+        model="llama-3.1-8b-instant",
+        max_tokens=5
+    )
+    print("Groq API работает, модель llama-3.1-8b-instant доступна.")
+except Exception as e:
+    print(f"Ошибка проверки Groq API: {e}")
+    print("Попробуем использовать модель mixtral-8x7b-32768 вместо llama-3.1-8b-instant.")
+    GROQ_MODEL = "mixtral-8x7b-32768"
+else:
+    GROQ_MODEL = "llama-3.1-8b-instant"
+
 # ---------- Хранилище истории ----------
 conversation_histories = defaultdict(list)
 MAX_MESSAGES = 12
@@ -60,7 +75,7 @@ def compress_history(chat_id):
                 {"role": "system", "content": SYSTEM_PROMPT + " Сделай краткую суммаризацию диалога, выдели ключевые темы и важные детали."},
                 {"role": "user", "content": f"Диалог:\n{dialog_text}"}
             ],
-            model="llama-3.1-8b-instant",
+            model=GROQ_MODEL,
             max_tokens=500,
             temperature=0.5,
         )
@@ -89,20 +104,23 @@ def generate_response_with_history(chat_id, user_message):
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history.copy()
     try:
+        print(f"Отправка запроса в Groq (модель {GROQ_MODEL}) с {len(messages)} сообщениями")
         completion = groq_client.chat.completions.create(
             messages=messages,
-            model="llama-3.1-8b-instant",
+            model=GROQ_MODEL,
             max_tokens=500,
             temperature=0.7,
         )
         assistant_reply = completion.choices[0].message.content
+        print("Ответ Groq получен успешно")
     except Exception as e:
         print(f"Ошибка генерации: {e}")
+        traceback.print_exc()
         assistant_reply = None
 
     if assistant_reply is None:
         assistant_reply = "Произошла ошибка при обработке запроса. Попробуйте позже."
-        history.pop()
+        history.pop()  # убираем сообщение пользователя
         return assistant_reply
 
     history.append({"role": "assistant", "content": assistant_reply})
@@ -298,7 +316,7 @@ def start_bot():
     print("HTTP-сервер для проверки порта запущен")
 
     print("Бот Fast Answer запущен (Long Polling)...")
-    print("Текст -> Groq, Фото -> " + ("Gemini" if gemini_model else "отключено") + ", Аудио -> Groq Whisper")
+    print("Текст -> Groq (модель " + GROQ_MODEL + "), Фото -> " + ("Gemini" if gemini_model else "отключено") + ", Аудио -> Groq Whisper")
 
     # Основной цикл с ручным управлением get_updates
     offset = None
@@ -306,14 +324,16 @@ def start_bot():
         try:
             updates = bot.get_updates(offset=offset, timeout=30)
             if updates:
+                print(f"Получено {len(updates)} обновлений")
                 for update in updates:
-                    # Обновляем offset, чтобы не получать одно и то же
                     offset = update.update_id + 1
-                    # Обрабатываем обновление
                     bot.process_new_updates([update])
-            # Если обновлений нет, просто продолжаем цикл
+            else:
+                # тихо, нет обновлений
+                pass
         except Exception as e:
             print(f"Ошибка в цикле получения обновлений: {e}")
+            traceback.print_exc()
             if "409" in str(e):
                 print("Конфликт (409), удаляем вебхук и ждём 30 секунд...")
                 try:
@@ -321,7 +341,7 @@ def start_bot():
                 except:
                     pass
                 time.sleep(30)
-                offset = None  # сброс offset для перезапуска
+                offset = None
             else:
                 print("Неизвестная ошибка, ждём 10 секунд...")
                 time.sleep(10)
