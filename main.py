@@ -1,182 +1,144 @@
 import os
 import telebot
 import tempfile
-import json
-import time
-from huggingface_hub import InferenceClient
-from groq import Groq
-import file_parser
 import traceback
+from groq import Groq
+import google.generativeai as genai
+import file_parser
 from collections import defaultdict
 
 # ---------- Переменные окружения ----------
 TOKEN = os.environ.get("BOT_TOKEN")
-HF_TOKEN = os.environ.get("HF_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 if not TOKEN:
     raise ValueError("BOT_TOKEN не задан!")
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY не задан!")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY не задан!")
 
 # ---------- Инициализация клиентов ----------
 bot = telebot.TeleBot(TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
-hf_client = InferenceClient(token=HF_TOKEN) if HF_TOKEN else None
+genai.configure(api_key=GOOGLE_API_KEY)
+gemini_model = genai.GenerativeModel('gemini-1.5-flash')  # для описания фото
 
-# ---------- Хранилище истории (в памяти) ----------
-# Ключ: chat_id (int), значение: список словарей [{"role": "user/assistant", "content": "..."}]
+# ---------- Хранилище истории ----------
 conversation_histories = defaultdict(list)
+MAX_MESSAGES = 12
+MAX_CONTENT_LENGTH = 2000
 
-# Параметры сжатия
-MAX_MESSAGES = 12          # Максимальное количество сообщений в истории до сжатия
-MAX_CONTENT_LENGTH = 2000  # Максимальная общая длина текста до сжатия
-
-# ---------- Функция для получения истории ----------
+# ---------- Функции для работы с историей ----------
 def get_history(chat_id):
-    """Возвращает историю для указанного чата."""
     return conversation_histories[chat_id]
 
-# ---------- Функция для добавления сообщения в историю ----------
-def add_to_history(chat_id, role, content):
-    """Добавляет сообщение в историю и при необходимости сжимает."""
-    history = conversation_histories[chat_id]
-    history.append({"role": role, "content": content})
-    
-    # Проверяем, нужно ли сжать историю
-    if len(history) > MAX_MESSAGES or sum(len(m["content"]) for m in history) > MAX_CONTENT_LENGTH:
-        compress_history(chat_id)
-
-# ---------- Функция сжатия истории (без уведомления) ----------
 def compress_history(chat_id):
-    """
-    Сжимает историю диалога, заменяя всю историю на суммаризацию.
-    Работает без вывода сообщений пользователю.
-    """
     history = conversation_histories[chat_id]
     if not history:
         return
-    
-    # Формируем текст диалога для суммаризации
     dialog_text = "\n".join([f"{m['role']}: {m['content']}" for m in history])
-    
     try:
-        # Запрос к Groq на суммаризацию
         completion = groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "Ты — полезный ассистент. Сделай краткую, но информативную суммаризацию следующего диалога. Выдели основные темы, запросы пользователя и ключевые ответы. Сохрани важные детали."},
+                {"role": "system", "content": "Сделай краткую суммаризацию диалога, выдели ключевые темы и важные детали."},
                 {"role": "user", "content": f"Диалог:\n{dialog_text}"}
             ],
-            model="gemma2-9b-it",
+            model="llama-3.1-8b-instant",
             max_tokens=500,
             temperature=0.5,
         )
         summary = completion.choices[0].message.content
+        conversation_histories[chat_id] = [
+            {"role": "assistant", "content": f"Краткое содержание предыдущего диалога:\n{summary}"}
+        ]
     except Exception as e:
-        # Если не удалось сжать, оставляем историю как есть (но можно обрезать)
-        print(f"Ошибка сжатия истории для {chat_id}: {e}")
-        # Вместо ошибки просто обрежем историю до последних 6 сообщений
+        print(f"Ошибка сжатия: {e}")
         if len(history) > 6:
             conversation_histories[chat_id] = history[-6:]
-        return
 
-    # Заменяем историю на одно сообщение от ассистента с суммаризацией
-    conversation_histories[chat_id] = [
-        {"role": "assistant", "content": f"Краткое содержание предыдущего диалога:\n{summary}"}
-    ]
-    # Можно также добавить последние 2 сообщения пользователя, чтобы сохранить контекст,
-    # но для простоты оставим только суммаризацию.
-
-# ---------- Функция для генерации ответа с учётом истории ----------
-def generate_response_with_history(chat_id, user_message):
-    """
-    Генерирует ответ, используя историю чата и новое сообщение пользователя.
-    Добавляет ответ в историю.
-    """
-    history = get_history(chat_id)
-    # Добавляем новое сообщение пользователя в историю (перед генерацией)
-    history.append({"role": "user", "content": user_message})
-    
-    # Проверяем длину и при необходимости сжимаем (теперь уже после добавления)
+def add_to_history(chat_id, role, content):
+    history = conversation_histories[chat_id]
+    history.append({"role": role, "content": content})
     if len(history) > MAX_MESSAGES or sum(len(m["content"]) for m in history) > MAX_CONTENT_LENGTH:
         compress_history(chat_id)
-        # После сжатия история стала короче, но текущее сообщение пользователя не сохранилось,
-        # поэтому добавляем его заново
+
+def generate_response_with_history(chat_id, user_message):
+    history = get_history(chat_id)
+    history.append({"role": "user", "content": user_message})
+    if len(history) > MAX_MESSAGES or sum(len(m["content"]) for m in history) > MAX_CONTENT_LENGTH:
+        compress_history(chat_id)
+        # после сжатия добавляем сообщение заново
         history = get_history(chat_id)
         history.append({"role": "user", "content": user_message})
-    
-    # Формируем список сообщений для Groq (все кроме последнего? Все)
-    messages = history.copy()  # уже включает user сообщение
-    
+
+    messages = history.copy()
     try:
         completion = groq_client.chat.completions.create(
             messages=messages,
-            model="gemma2-9b-it",
+            model="llama-3.1-8b-instant",
             max_tokens=500,
             temperature=0.7,
         )
         assistant_reply = completion.choices[0].message.content
     except Exception as e:
-        assistant_reply = f"❌ Ошибка при генерации текста: {e}"
-    
-    # Добавляем ответ ассистента в историю
+        assistant_reply = f"❌ Ошибка генерации: {e}"
+
     history.append({"role": "assistant", "content": assistant_reply})
-    # Обновляем историю (сохраняем)
     conversation_histories[chat_id] = history
-    
     return assistant_reply
 
-# ---------- Остальные функции (фото, аудио, документы) ----------
-# (они используют отдельные функции, но для них тоже можно добавить историю,
-# но пока оставим как есть, чтобы не усложнять)
-
+# ---------- Функция описания фото через Gemini ----------
 def describe_image(image_path: str) -> str:
-    if not hf_client:
-        return "⚠️ API для изображений не настроен (нет HF_TOKEN)."
     try:
+        # Загружаем изображение
         with open(image_path, "rb") as f:
-            image_bytes = f.read()
-        result = hf_client.image_to_text(
-            model="Salesforce/blip-image-captioning-large",
-            image=image_bytes
+            image_data = f.read()
+        # Отправляем в Gemini
+        response = gemini_model.generate_content(
+            ["Опиши кратко, что изображено на этом фото.", {"mime_type": "image/jpeg", "data": image_data}]
         )
-        return result.generated_text if result else "Не удалось описать изображение."
+        return response.text if response.text else "Не удалось описать изображение."
     except Exception as e:
-        if "402" in str(e):
-            return "⚠️ Закончились кредиты Hugging Face для изображений."
-        return f"❌ Ошибка при описании фото: {e}"
+        return f"❌ Ошибка описания фото: {e}"
 
+# ---------- Функция транскрипции аудио через Groq Whisper ----------
 def transcribe_audio(audio_path: str) -> str:
-    if not hf_client:
-        return "⚠️ API для аудио не настроен (нет HF_TOKEN)."
     try:
         with open(audio_path, "rb") as f:
             audio_bytes = f.read()
-        result = hf_client.automatic_speech_recognition(
-            model="openai/whisper-large-v3",
-            audio=audio_bytes
-        )
-        return result.text if result else "Не удалось распознать речь."
+        # Groq поддерживает только файлы, поэтому сохраняем и используем путь
+        # Но в Groq SDK есть метод audio.transcriptions.create, принимающий файл.
+        # Проще использовать requests напрямую.
+        import requests
+        url = "https://api.groq.com/openai/v1/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        files = {"file": (os.path.basename(audio_path), audio_bytes, "audio/mpeg")}
+        data = {"model": "whisper-large-v3", "response_format": "text"}
+        response = requests.post(url, headers=headers, files=files, data=data)
+        if response.status_code == 200:
+            return response.text.strip()
+        else:
+            return f"Ошибка транскрипции: {response.text}"
     except Exception as e:
-        if "402" in str(e):
-            return "⚠️ Закончились кредиты Hugging Face для аудио."
-        return f"❌ Ошибка при транскрипции: {e}"
+        return f"❌ Ошибка: {e}"
 
 # ---------- Обработчики ----------
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.send_message(message.chat.id,
         "🚀 Привет! Я бот **Fast Answer**.\n"
-        "📝 Отправь мне текст, фото, аудио или документ — я дам быстрый ответ.\n"
-        "💬 Я запоминаю историю диалога и автоматически сжимаю длинные разговоры для экономии контекста.")
+        "📝 Отправь текст, фото, аудио или документ.\n"
+        "🔹 Текст → Groq (быстро)\n"
+        "🔹 Фото → Google Gemini\n"
+        "🔹 Аудио → Groq Whisper\n"
+        "💬 Я запоминаю историю и сжимаю длинные диалоги.")
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     user_text = message.text.strip()
-    if not user_text:
-        bot.reply_to(message, "Пустое сообщение...")
-        return
-    if user_text == '/start':
+    if not user_text or user_text == '/start':
         return
     bot.send_chat_action(message.chat.id, "typing")
     chat_id = message.chat.id
@@ -227,21 +189,19 @@ def handle_document(message):
 
         extracted_text = file_parser.parse_file(tmp_path, extension)
         if not extracted_text:
-            bot.reply_to(message, "📄 В документе нет текста для обработки.")
+            bot.reply_to(message, "📄 В документе нет текста.")
             return
-
         if len(extracted_text) > 3000:
-            extracted_text = extracted_text[:3000] + "\n... (текст обрезан)"
+            extracted_text = extracted_text[:3000] + "\n... (обрезано)"
 
         bot.send_chat_action(message.chat.id, "typing")
-        # Используем историю для ответа по документу
-        prompt = f"Содержание документа:\n{extracted_text}\n\nДай краткий ответ по этому содержанию."
+        prompt = f"Содержание документа:\n{extracted_text}\n\nДай краткий ответ."
         chat_id = message.chat.id
         answer = generate_response_with_history(chat_id, prompt)
         bot.reply_to(message, f"📄 Ответ:\n{answer}")
 
     except file_parser.ParseError as e:
-        bot.reply_to(message, f"⚠️ Ошибка парсинга файла: {e}")
+        bot.reply_to(message, f"⚠️ Ошибка парсинга: {e}")
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
         traceback.print_exc()
@@ -253,23 +213,24 @@ def handle_document(message):
 def handle_audio(message):
     tmp_path = None
     try:
-        file_id = message.voice.file_id if message.content_type == 'voice' else message.audio.file_id
+        if message.content_type == 'voice':
+            file_id = message.voice.file_id
+            ext = '.ogg'
+        else:
+            file_id = message.audio.file_id
+            ext = '.mp3'
         file_info = bot.get_file(file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        ext = '.ogg' if message.content_type == 'voice' else '.mp3'
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             tmp.write(downloaded_file)
             tmp_path = tmp.name
 
         bot.send_chat_action(message.chat.id, "typing")
         transcript = transcribe_audio(tmp_path)
-        if transcript.startswith("⚠️") or transcript.startswith("❌"):
-            bot.reply_to(message, transcript)
+        if transcript.startswith("Ошибка") or transcript.startswith("❌"):
+            bot.reply_to(message, f"🎤 {transcript}")
             return
-
         bot.reply_to(message, f"🎤 Распознано:\n{transcript}")
-
-        # Генерируем ответ по транскрипции с историей
         chat_id = message.chat.id
         answer = generate_response_with_history(chat_id, f"Вопрос по аудио: {transcript}")
         bot.send_message(message.chat.id, f"💬 {answer}")
@@ -282,16 +243,15 @@ def handle_audio(message):
 
 @bot.message_handler(content_types=['video'])
 def handle_video(message):
-    bot.reply_to(message, "🎬 Видео пока не обрабатываются, но скоро добавлю!")
+    bot.reply_to(message, "🎬 Видео пока не поддерживается.")
 
 @bot.message_handler(content_types=['sticker', 'contact', 'location', 'venue', 'animation', 'video_note'])
 def handle_other(message):
-    bot.reply_to(message, "Извините, я пока не умею обрабатывать этот тип контента.")
+    bot.reply_to(message, "Извините, я не умею обрабатывать этот тип.")
 
 # ---------- Запуск ----------
 if __name__ == '__main__':
     bot.remove_webhook()
     print("🚀 Бот Fast Answer запущен (Long Polling)...")
-    print("🤖 Текст → Groq | 📸 / 🎤 → Hugging Face")
-    print(f"📚 История хранится в памяти, сжатие при >{MAX_MESSAGES} сообщений или >{MAX_CONTENT_LENGTH} символов.")
+    print("🤖 Текст → Groq | 📸 → Gemini | 🎤 → Groq Whisper")
     bot.infinity_polling()
