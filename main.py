@@ -1,8 +1,14 @@
 import os
 import telebot
 from flask import Flask, request
+import traceback
 
 TOKEN = os.environ.get("BOT_TOKEN")
+print(f"TOKEN loaded: {'YES' if TOKEN else 'NO'}")  # Проверка, что токен загружен
+
+if not TOKEN:
+    raise ValueError("BOT_TOKEN not set in environment!")
+
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
@@ -12,10 +18,15 @@ def start(message):
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    json_str = request.stream.read().decode("utf-8")
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
-    return "OK", 200
+    try:
+        json_str = request.stream.read().decode("utf-8")
+        update = telebot.types.Update.de_json(json_str)
+        bot.process_new_updates([update])
+        return "OK", 200
+    except Exception as e:
+        print("ERROR in webhook:")
+        print(traceback.format_exc())
+        return "ERROR", 500
 
 @app.route('/')
 def index():
