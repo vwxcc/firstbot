@@ -4,6 +4,7 @@ import tempfile
 import traceback
 import time
 import threading
+import requests
 from groq import Groq
 import file_parser
 from collections import defaultdict
@@ -22,7 +23,7 @@ if not GROQ_API_KEY:
 # ---------- Инициализация клиентов ----------
 bot = telebot.TeleBot(TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
-app = Flask(__name__)  # для HTTP-сервера
+app = Flask(__name__)
 
 # Инициализация Gemini, если ключ есть
 gemini_model = None
@@ -128,7 +129,6 @@ def transcribe_audio(audio_path: str) -> str:
     try:
         with open(audio_path, "rb") as f:
             audio_bytes = f.read()
-        import requests
         url = "https://api.groq.com/openai/v1/audio/transcriptions"
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
         files = {"file": (os.path.basename(audio_path), audio_bytes, "audio/mpeg")}
@@ -278,41 +278,53 @@ def health_check():
     return "OK", 200
 
 def run_flask():
-    # Получаем порт из переменной окружения Render (по умолчанию 10000)
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# ---------- Запуск бота и HTTP-сервера ----------
+# ---------- Запуск бота с ручным управлением polling ----------
 def start_bot():
-    # Удаляем вебхук, чтобы избежать конфликта
+    # Принудительно удаляем вебхук через API
     try:
-        bot.remove_webhook()
-        print("Вебхук удалён")
+        r = requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook")
+        print("deleteWebhook response:", r.json())
     except Exception as e:
         print(f"Ошибка удаления вебхука: {e}")
-    time.sleep(2)
 
-    print("Бот Fast Answer запущен (Long Polling)...")
-    print("Текст -> Groq, Фото -> " + ("Gemini" if gemini_model else "отключено") + ", Аудио -> Groq Whisper")
+    time.sleep(3)
 
-    # Запускаем Flask-сервер в отдельном потоке
+    # Запускаем Flask в отдельном потоке
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print("HTTP-сервер для проверки порта запущен")
 
-    # Запускаем бота
+    print("Бот Fast Answer запущен (Long Polling)...")
+    print("Текст -> Groq, Фото -> " + ("Gemini" if gemini_model else "отключено") + ", Аудио -> Groq Whisper")
+
+    # Основной цикл с ручным управлением get_updates
+    offset = None
     while True:
         try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=30)
+            updates = bot.get_updates(offset=offset, timeout=30)
+            if updates:
+                for update in updates:
+                    # Обновляем offset, чтобы не получать одно и то же
+                    offset = update.update_id + 1
+                    # Обрабатываем обновление
+                    bot.process_new_updates([update])
+            # Если обновлений нет, просто продолжаем цикл
         except Exception as e:
-            print(f"Ошибка polling: {e}")
+            print(f"Ошибка в цикле получения обновлений: {e}")
             if "409" in str(e):
-                print("Конфликт (409), повтор через 10 секунд...")
-                time.sleep(10)
-                continue
-            else:
-                print("Неизвестная ошибка, перезапуск через 30 секунд...")
+                print("Конфликт (409), удаляем вебхук и ждём 30 секунд...")
+                try:
+                    requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook")
+                except:
+                    pass
                 time.sleep(30)
+                offset = None  # сброс offset для перезапуска
+            else:
+                print("Неизвестная ошибка, ждём 10 секунд...")
+                time.sleep(10)
 
 if __name__ == '__main__':
     start_bot()
