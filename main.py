@@ -2,28 +2,38 @@ import os
 import telebot
 import tempfile
 import traceback
+import time
 from groq import Groq
-import google.generativeai as genai
 import file_parser
 from collections import defaultdict
 
 # ---------- Переменные окружения ----------
 TOKEN = os.environ.get("BOT_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")  # опционально
 
 if not TOKEN:
     raise ValueError("BOT_TOKEN не задан!")
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY не задан!")
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY не задан!")
 
 # ---------- Инициализация клиентов ----------
 bot = telebot.TeleBot(TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
-genai.configure(api_key=GOOGLE_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')  # для описания фото
+
+# Инициализация Gemini, если ключ есть
+if GOOGLE_API_KEY:
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GOOGLE_API_KEY)
+        gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+        print("✅ Google Gemini инициализирован для фото.")
+    except Exception as e:
+        print(f"⚠️ Ошибка инициализации Gemini: {e}")
+        gemini_model = None
+else:
+    gemini_model = None
+    print("ℹ️ GOOGLE_API_KEY не задан, функция описания фото отключена.")
 
 # ---------- Хранилище истории ----------
 conversation_histories = defaultdict(list)
@@ -54,7 +64,7 @@ def compress_history(chat_id):
             {"role": "assistant", "content": f"Краткое содержание предыдущего диалога:\n{summary}"}
         ]
     except Exception as e:
-        print(f"Ошибка сжатия: {e}")
+        print(f"⚠️ Ошибка сжатия: {e}")
         if len(history) > 6:
             conversation_histories[chat_id] = history[-6:]
 
@@ -69,7 +79,6 @@ def generate_response_with_history(chat_id, user_message):
     history.append({"role": "user", "content": user_message})
     if len(history) > MAX_MESSAGES or sum(len(m["content"]) for m in history) > MAX_CONTENT_LENGTH:
         compress_history(chat_id)
-        # после сжатия добавляем сообщение заново
         history = get_history(chat_id)
         history.append({"role": "user", "content": user_message})
 
@@ -89,13 +98,13 @@ def generate_response_with_history(chat_id, user_message):
     conversation_histories[chat_id] = history
     return assistant_reply
 
-# ---------- Функция описания фото через Gemini ----------
+# ---------- Функция описания фото (если доступен Gemini) ----------
 def describe_image(image_path: str) -> str:
+    if gemini_model is None:
+        return "⚠️ Функция описания фото временно недоступна. Добавьте GOOGLE_API_KEY в настройки."
     try:
-        # Загружаем изображение
         with open(image_path, "rb") as f:
             image_data = f.read()
-        # Отправляем в Gemini
         response = gemini_model.generate_content(
             ["Опиши кратко, что изображено на этом фото.", {"mime_type": "image/jpeg", "data": image_data}]
         )
@@ -108,9 +117,6 @@ def transcribe_audio(audio_path: str) -> str:
     try:
         with open(audio_path, "rb") as f:
             audio_bytes = f.read()
-        # Groq поддерживает только файлы, поэтому сохраняем и используем путь
-        # Но в Groq SDK есть метод audio.transcriptions.create, принимающий файл.
-        # Проще использовать requests напрямую.
         import requests
         url = "https://api.groq.com/openai/v1/audio/transcriptions"
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
@@ -131,7 +137,7 @@ def start(message):
         "🚀 Привет! Я бот **Fast Answer**.\n"
         "📝 Отправь текст, фото, аудио или документ.\n"
         "🔹 Текст → Groq (быстро)\n"
-        "🔹 Фото → Google Gemini\n"
+        "🔹 Фото → " + ("Google Gemini" if gemini_model else "отключено (нужен ключ)") + "\n"
         "🔹 Аудио → Groq Whisper\n"
         "💬 Я запоминаю историю и сжимаю длинные диалоги.")
 
@@ -249,9 +255,22 @@ def handle_video(message):
 def handle_other(message):
     bot.reply_to(message, "Извините, я не умею обрабатывать этот тип.")
 
-# ---------- Запуск ----------
-if __name__ == '__main__':
+# ---------- Запуск с повторными попытками при конфликте ----------
+def start_bot():
     bot.remove_webhook()
     print("🚀 Бот Fast Answer запущен (Long Polling)...")
-    print("🤖 Текст → Groq | 📸 → Gemini | 🎤 → Groq Whisper")
-    bot.infinity_polling()
+    print("🤖 Текст → Groq | 📸 → " + ("Gemini" if gemini_model else "отключено") + " | 🎤 → Groq Whisper")
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=30)
+        except Exception as e:
+            print(f"❌ Ошибка polling: {e}")
+            if "409" in str(e):
+                print("⚠️ Конфликт (409), повтор через 10 секунд...")
+                time.sleep(10)
+                continue
+            else:
+                raise
+
+if __name__ == '__main__':
+    start_bot()
