@@ -1,697 +1,536 @@
 import os
 import json
 import time
-import threading
-import traceback
+import base64
 import tempfile
 import subprocess
-import base64
 import re
-
-from pathlib import Path
-from typing import Optional
+from typing import List, Dict, Optional
 
 import telebot
+from telebot.apihelper import ApiTelegramException
 from groq import Groq
+import httpx
 
-import file_parser
+# Нативная интеграция поддержки HEIC/HEIF в Pillow
+from PIL import Image
+from pillow_heif import register_heif_opener
+register_heif_opener()
 
-# ============================================================
-# CONFIG / CLIENTS
-# ============================================================
+from file_parser import parse_file
 
+# ==========================================
+# 1. КОНФИГУРАЦИЯ И СИСТЕМНЫЕ ЗАВИСИМОСТИ
+# ==========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
-
-if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY не задан в переменных окружения")
+if not BOT_TOKEN or not GROQ_API_KEY:
+    print("[FATAL] BOT_TOKEN или GROQ_API_KEY отсутствуют в системном окружении. Остановка приложения.")
+    exit(1)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# ============================================================
-# PATHS / STORAGE
-# ============================================================
+# Конфигурация постоянного хранилища (Persistent Storage на Render)
+HISTORY_FILE = os.getenv("HISTORY_FILE_PATH", "/data/history.json")
+if not os.path.exists(os.path.dirname(HISTORY_FILE)) and os.path.dirname(HISTORY_FILE) != "":
+    # Fallback для локального тестирования вне среды Render
+    HISTORY_FILE = "local_history.json"
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-HISTORY_FILE = DATA_DIR / "history.json"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+COMPRESSION_EVERY = 12
+MAX_CHARS_BEFORE_COMPRESSION = 2000
 
-# ============================================================
-# SETTINGS
-# ============================================================
-
-COMPRESSION_EVERY_USER_MESSAGES = 12
-KEEP_RECENT_MESSAGES = 8
-MAX_HISTORY_CHARS = 30000
-MAX_USER_TEXT_CHARS = 20000
-MAX_OUTPUT_TOKENS = 2000
-MODEL_PRIORITY = [
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "qwen/qwen3-32b",
+# Иерархия моделей для обеспечения отказоустойчивости (Fallback)
+TEXT_MODELS = [
+    "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
+    "gemma2-9b-it"
 ]
-FALLBACK_RECENT_MESSAGES = 8
 
-# Locks and in-memory history
-history_lock = threading.RLock()
+VISION_MODELS = [
+    "llama-3.2-90b-vision-preview",
+    "llama-3.2-11b-vision-preview"
+]
+
+AUDIO_MODELS = [
+    "whisper-large-v3-turbo",
+    "whisper-large-v3"
+]
+
+SYSTEM_PROMPT = """Ты — полезный AI-ассистент профессионального уровня.
+СТРОГИЕ ПРАВИЛА:
+1. Отвечай ИСКЛЮЧИТЕЛЬНО на русском языке, независимо от языка запроса (если пользователь явно не попросил перевести).
+2. Формулируй мысли четко, без лишних вводных слов и рассуждений.
+3. Отвечай непосредственно на поставленный вопрос.
+4. Обязательно учитывай контекст предыдущего диалога.
+5. Не используй избыточное форматирование Markdown (ограничь использование жирного текста и заголовков)."""
+
+# Оперативная память для кэширования истории (RAM Storage)
 conversation_histories = {}
 
-# ============================================================
-# HELPERS: load/save history
-# ============================================================
-
+# ==========================================
+# 2. ПОДСИСТЕМА УПРАВЛЕНИЯ ПАМЯТЬЮ И СЖАТИЯ
+# ==========================================
 def load_histories():
+    """Загрузка персистентной истории из JSON файла в RAM."""
     global conversation_histories
-    if not HISTORY_FILE.exists():
-        conversation_histories = {}
-        return
-    try:
-        with history_lock:
+    if os.path.exists(HISTORY_FILE):
+        try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                conversation_histories = data
-            else:
-                conversation_histories = {}
-        print(f"История загружена: {len(conversation_histories)} чатов")
-    except Exception as e:
-        print("ОШИБКА ЗАГРУЗКИ ИСТОРИИ:")
-        print(repr(e))
-        traceback.print_exc()
-        conversation_histories = {}
-
+                conversation_histories = json.load(f)
+            print(f"[HISTORY] База данных диалогов успешно загружена из {HISTORY_FILE}")
+        except Exception as e:
+            print(f"[HISTORY] Критическая ошибка десериализации {HISTORY_FILE}: {e}")
+            conversation_histories = {}
 
 def save_histories():
-    temp_file = HISTORY_FILE.with_suffix(".tmp")
+    """Атомарная транзакция сохранения для предотвращения повреждения файла при SIGKILL."""
+    temp_file = HISTORY_FILE + ".tmp"
     try:
-        with history_lock:
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(conversation_histories, f, ensure_ascii=False, indent=2)
-            os.replace(temp_file, HISTORY_FILE)
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(conversation_histories, f, ensure_ascii=False, indent=2)
+        os.replace(temp_file, HISTORY_FILE)
     except Exception as e:
-        print("ОШИБКА СОХРАНЕНИЯ ИСТОРИИ:")
-        print(repr(e))
-        traceback.print_exc()
+        print(f"[HISTORY] Сбой фиксации транзакции истории: {e}")
 
-# ============================================================
-# HISTORY HELPERS
-# ============================================================
-
-def get_history(chat_id):
-    chat_id = str(chat_id)
-    with history_lock:
-        if chat_id not in conversation_histories:
-            conversation_histories[chat_id] = {
-                "summary": "",
-                "messages": [],
-                "user_messages_since_compression": 0,
-            }
-        return conversation_histories[chat_id]
-
-
-def add_message(chat_id, role, content):
-    chat_id = str(chat_id)
-    with history_lock:
-        history = get_history(chat_id)
-        history["messages"].append({"role": role, "content": content})
-        if role == "user":
-            history["user_messages_since_compression"] += 1
-        save_histories()
-
-
-def total_history_chars(history):
-    total = len(history.get("summary", ""))
-    for message in history.get("messages", []):
-        total += len(str(message.get("content", "")))
-    return total
-
-# ============================================================
-# MODEL DISCOVERY
-# ============================================================
-
-def get_available_models():
-    try:
-        models_response = groq_client.models.list()
-        available = set()
-        for model in models_response.data:
-            model_id = getattr(model, "id", None)
-            if model_id:
-                available.add(model_id)
-        selected = [m for m in MODEL_PRIORITY if m in available]
-        return selected if selected else MODEL_PRIORITY.copy()
-    except Exception as e:
-        print("ОШИБКА ПОЛУЧЕНИЯ СПИСКА МОДЕЛЕЙ:", repr(e))
-        traceback.print_exc()
-        return MODEL_PRIORITY.copy()
-
-AVAILABLE_MODELS = get_available_models()
-
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
-
-SYSTEM_PROMPT = """
-Ты — Fast Answer, интеллектуальный Telegram-ассистент.
-
-Главные правила:
-
-1. Всегда отвечай пользователю на русском языке,
-   если пользователь явно не попросил другой язык.
-
-2. Отвечай понятно, точно и по существу.
-
-3. Не выдумывай факты.
-   Если не уверен — прямо скажи об этом.
-
-4. Учитывай предыдущую историю диалога.
-
-5. Если пользователь ссылается на предыдущие сообщения,
-   используй сохранённую историю.
-
-6. Не говори пользователю о внутренних моделях,
-   API, fallback-механизме или технической реализации,
-   если это не является предметом вопроса.
-
-7. Если пользователь прислал текст документа,
-   анализируй именно этот документ.
-
-8. Не повторяй вопрос пользователя без необходимости.
-
-9. Если задача требует пошагового решения,
-   давай решение последовательно.
-
-10. Форматируй ответ так, чтобы его было удобно читать
-    в Telegram.
-"""
-
-# ============================================================
-# BUILD MESSAGES
-# ============================================================
-
-def build_messages(chat_id):
-    history = get_history(chat_id)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    summary = history.get("summary", "").strip()
-    if summary:
-        messages.append({"role": "system", "content": "Краткое содержание предыдущей части диалога:\n" + summary})
-    for message in history.get("messages", []):
-        role = message.get("role")
-        content = message.get("content", "")
-        if role not in ("user", "assistant"):
-            continue
-        messages.append({"role": role, "content": content})
-    return messages
-
-# ============================================================
-# HISTORY COMPRESSION
-# ============================================================
-
-def compress_history(chat_id):
-    chat_id = str(chat_id)
-    history = get_history(chat_id)
-    messages = history.get("messages", [])
-    if not messages:
-        return True
-    dialog_parts = []
-    for message in messages:
-        role = message.get("role")
-        role_name = "Пользователь" if role == "user" else "Ассистент"
-        dialog_parts.append(f"{role_name}: {message.get('content', '')}")
-    dialog_text = "\n\n".join(dialog_parts)
-    old_summary = history.get("summary", "").strip()
-    if old_summary:
-        compression_input = f"Предыдущее резюме:\n{old_summary}\n\nНовые сообщения диалога:\n{dialog_text}"
+def add_message(chat_id: int, role: str, content: str):
+    """Добавление сообщения в контекст и триггер фонового сжатия."""
+    chat_id_str = str(chat_id)
+    if chat_id_str not in conversation_histories:
+        conversation_histories[chat_id_str] = []
+    
+    conversation_histories[chat_id_str].append({"role": role, "content": content})
+    
+    # Эвристика необходимости сжатия контекста
+    user_msgs = sum(1 for m in conversation_histories[chat_id_str] if m['role'] == 'user')
+    total_chars = sum(len(m['content']) for m in conversation_histories[chat_id_str])
+    
+    if user_msgs >= COMPRESSION_EVERY or total_chars > MAX_CHARS_BEFORE_COMPRESSION:
+        compress_history(chat_id_str)
     else:
-        compression_input = f"Сообщения диалога:\n{dialog_text}"
-    compression_prompt = """
-Сожми историю разговора.
-
-Твоя задача — создать компактное, но информативное резюме,
-которое позволит другому ИИ продолжить разговор так,
-будто он видел всю предыдущую переписку.
-
-Обязательно сохрани:
-
-- главные темы;
-- цели пользователя;
-- важные факты;
-- конкретные числа;
-- названия;
-- решения, которые уже были приняты;
-- предпочтения пользователя, если они важны;
-- незавершённые задачи;
-- контекст последних вопросов.
-
-Не придумывай ничего нового.
-
-Пиши резюме на русском языке.
-
-Не пиши вступление вроде "Вот краткое содержание".
-Сразу дай содержание.
-"""
-    compression_messages = [{"role": "system", "content": compression_prompt}, {"role": "user", "content": compression_input}]
-    last_error = None
-    for model in AVAILABLE_MODELS:
-        try:
-            completion = groq_client.chat.completions.create(model=model, messages=compression_messages, max_tokens=1200, temperature=0.2)
-            summary = completion.choices[0].message.content.strip()
-            if not summary:
-                raise RuntimeError("Модель вернула пустое резюме.")
-            with history_lock:
-                recent = messages[-KEEP_RECENT_MESSAGES:]
-                history["summary"] = summary
-                history["messages"] = recent
-                history["user_messages_since_compression"] = 0
-                save_histories()
-            return True
-        except Exception as e:
-            last_error = e
-            print(f"[HISTORY] ОШИБКА МОДЕЛИ {model}:")
-            print(repr(e))
-            traceback.print_exc()
-            continue
-    # fallback
-    with history_lock:
-        history["messages"] = messages[-FALLBACK_RECENT_MESSAGES:]
-        history["user_messages_since_compression"] = 0
         save_histories()
-    return False
 
-
-def should_compress(chat_id):
-    history = get_history(chat_id)
-    user_count = history.get("user_messages_since_compression", 0)
-    chars = total_history_chars(history)
-    return user_count >= COMPRESSION_EVERY_USER_MESSAGES or chars >= MAX_HISTORY_CHARS
-
-# ============================================================
-# CLEAN ANSWER (remove excessive Markdown)
-# ============================================================
-
-def clean_answer(text: str) -> str:
-    """
-    Убирает из ответа чрезмерное Markdown-форматирование.
-    """
-    if not text:
-        return text
-    text = text.replace("***", "")
-    text = text.replace("**", "")
-    text = re.sub(r"(?<!\w)__([^_\n]+)__", r"\1", text)
-    text = re.sub(r"(?<!\w)\*([^*\n]+)\*", r"\1", text)
-    text = re.sub(r"(?m)^\s*#{1,6}\s+", "", text)
-    text = re.sub(r"(?m)^\s*\*+\s*$", "", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-# ============================================================
-# GENERATE RESPONSE (uses Groq) — now cleans the answer
-# ============================================================
-
-def generate_response(chat_id, user_message):
-    chat_id = str(chat_id)
-    user_message = user_message.strip()
-    if len(user_message) > MAX_USER_TEXT_CHARS:
-        user_message = user_message[:MAX_USER_TEXT_CHARS] + "\n\n[Текст был автоматически сокращён из-за ограничения размера.]"
-    add_message(chat_id, "user", user_message)
-    if should_compress(chat_id):
-        try:
-            compress_history(chat_id)
-        except Exception as e:
-            print("[HISTORY] Критическая ошибка сжатия:", repr(e))
-            traceback.print_exc()
-    messages = build_messages(chat_id)
-    last_error = None
-    for index, model in enumerate(AVAILABLE_MODELS):
-        try:
-            completion = groq_client.chat.completions.create(model=model, messages=messages, max_tokens=MAX_OUTPUT_TOKENS, temperature=0.7)
-            answer = completion.choices[0].message.content.strip()
-            if not answer:
-                raise RuntimeError("Модель вернула пустой ответ.")
-            answer = clean_answer(answer)
-            add_message(chat_id, "assistant", answer)
-            return answer
-        except Exception as e:
-            last_error = e
-            print("\n" + "=" * 70)
-            print(f"[AI] ОШИБКА МОДЕЛИ: {model}")
-            print(f"[AI] Ошибка: {repr(e)}")
-            print("=" * 70)
-            traceback.print_exc()
-            if index + 1 < len(AVAILABLE_MODELS):
-                continue
-    print("[AI] ВСЕ МОДЕЛИ НЕ СРАБОТАЛИ.")
-    if last_error:
-        print("[AI] Последняя ошибка:", repr(last_error))
-    return ("⚠️ Сейчас не удалось получить ответ от ИИ. Я попробовал несколько доступных моделей. Попробуй отправить запрос ещё раз немного позже.")
-
-# ============================================================
-# TELEGRAM SPLIT / SEND
-# ============================================================
-
-def split_text(text, max_length=4000):
-    if len(text) <= max_length:
-        return [text]
-    parts = []
-    while len(text) > max_length:
-        split_at = text.rfind("\n", 0, max_length)
-        if split_at < max_length // 2:
-            split_at = text.rfind(" ", 0, max_length)
-        if split_at <= 0:
-            split_at = max_length
-        parts.append(text[:split_at].strip())
-        text = text[split_at:].strip()
-    if text:
-        parts.append(text)
-    return parts
-
-
-def send_long_message(chat_id, text, reply_to_message_id=None):
-    parts = split_text(text)
-    for index, part in enumerate(parts):
-        if index == 0 and reply_to_message_id:
-            bot.send_message(chat_id, part, reply_to_message_id=reply_to_message_id)
-        else:
-            bot.send_message(chat_id, part)
-
-# ============================================================
-# /start and text handlers
-# ============================================================
-
-@bot.message_handler(commands=["start"])
-def start(message):
-    get_history(message.chat.id)
-    bot.send_message(message.chat.id, "🚀 Привет! Я Fast Answer. Отправь текст, фото, аудио или документ.")
-
-@bot.message_handler(content_types=["text"])
-def handle_text(message):
-    user_text = (message.text or "").strip()
-    if not user_text:
+def compress_history(chat_id: str):
+    """Асинхронная суммаризация устаревшего контекста для высвобождения токенов."""
+    print(f"[HISTORY] Инициирована процедура сжатия для сессии {chat_id}")
+    history = conversation_histories[chat_id]
+    
+    # Сохраняем "горячий" контекст (последние 4 итерации)
+    to_compress = history[:-4]
+    to_keep = history[-4:]
+    
+    if not to_compress:
         return
-    if user_text.startswith("/"):
-        return
-    chat_id = message.chat.id
+
+    dialogue_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in to_compress])
+    
+    prompt = (
+        "Сделай максимально краткое и информативное резюме следующего диалога. "
+        "Выдели основные обсуждаемые темы, запросы пользователя и твои ключевые ответы. "
+        "Пиши только факты на русском языке.\n\n"
+        f"ДИАЛОГ:\n{dialogue_text}"
+    )
+
     try:
-        bot.send_chat_action(chat_id, "typing")
-        answer = generate_response(chat_id, user_text)
-        send_long_message(chat_id, answer, reply_to_message_id=message.message_id)
+        response = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=TEXT_MODELS[0],
+            temperature=0.2,
+            max_tokens=700,
+        )
+        summary = response.choices[0].message.content
+        
+        # Реконструкция памяти: системное саммари + горячий контекст
+        new_history = [{"role": "assistant", "content": f"[Архивное резюме контекста]: {summary}"}]
+        new_history.extend(to_keep)
+        
+        conversation_histories[chat_id] = new_history
+        save_histories()
+        print(f"[HISTORY] Процедура сжатия успешно завершена для {chat_id}")
     except Exception as e:
-        print("КРИТИЧЕСКАЯ ОШИБКА TEXT HANDLER:", repr(e))
-        traceback.print_exc()
-        bot.reply_to(message, "⚠️ Произошла внутренняя ошибка. Попробуй повторить запрос.")
+        print(f"[HISTORY] Ошибка нейросетевого сжатия: {e}. Контекст оставлен без изменений.")
 
-# ============================================================
-# VISION MODELS helper
-# ============================================================
+# ==========================================
+# 3. МАРШРУТИЗАЦИЯ И ОБРАБОТКА LLM (FALLBACK)
+# ==========================================
+def generate_response(chat_id: int) -> str:
+    """Текстовая генерация с каскадным переключением моделей."""
+    chat_id_str = str(chat_id)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(conversation_histories.get(chat_id_str, []))
 
-def get_vision_models():
-    env = os.environ.get("VISION_MODELS")
-    if env:
-        return [m.strip() for m in env.split(",") if m.strip()]
-    candidates = [
-        "meta-llama/llama-4-scout-17b-16e-instruct",
-        "meta-llama/llama-4-maverick-17b-128e-instruct",
-    ]
-    try:
-        models_response = groq_client.models.list()
-        available = {getattr(model, "id", "") for model in models_response.data}
-        return [m for m in candidates if m in available]
-    except Exception as e:
-        print("[VISION] Не удалось получить список моделей:", repr(e))
-        return []
-
-# ============================================================
-# PHOTO handler (replaced)
-# ============================================================
-
-@bot.message_handler(content_types=["photo"])
-def handle_photo(message):
-    chat_id = message.chat.id
-    try:
-        bot.send_chat_action(chat_id, "typing")
-        vision_models = get_vision_models()
-        if not vision_models:
-            bot.reply_to(message, "⚠️ Сейчас нет доступной модели для анализа изображений.")
-            return
-        photo = message.photo[-1]
-        file_info = bot.get_file(photo.file_id)
-        image_bytes = bot.download_file(file_info.file_path)
-        encoded_image = base64.b64encode(image_bytes).decode("utf-8")
-        user_request = (message.caption.strip() if message.caption else "Подробно проанализируй это изображение и ответь на русском языке.")
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "text", "text": user_request},
-                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + encoded_image}}
-            ]}
-        ]
-        last_error = None
-        for index, model in enumerate(vision_models):
-            try:
-                print(f"[VISION] Пробую модель: {model}", flush=True)
-                completion = groq_client.chat.completions.create(model=model, messages=messages, max_tokens=MAX_OUTPUT_TOKENS, temperature=0.5)
-                answer = completion.choices[0].message.content.strip()
-                answer = clean_answer(answer)
-                if not answer:
-                    raise RuntimeError("Vision-модель вернула пустой ответ.")
+    for model_name in TEXT_MODELS:
+        try:
+            print(f"[AI] Инициализация инференса. Модель: {model_name}")
+            response = groq_client.chat.completions.create(
+                messages=messages,
+                model=model_name,
+                temperature=0.6,
+                max_tokens=2500,
+                timeout=25.0
+            )
+            answer = response.choices[0].message.content
+            print(f"[AI] Успешная генерация: {model_name}")
+            return clean_answer(answer)
+        except Exception as e:
+            print(f"[AI] Ошибка модели {model_name}")
+            print(f"[AI] Трассировка сбоя: {e}")
+            print(f"[AI] Перенаправление на резервную модель...")
+            
+            if model_name != TEXT_MODELS[-1]:
                 try:
-                    add_message(chat_id, "user", "[Пользователь отправил изображение]\n" + user_request)
-                    add_message(chat_id, "assistant", answer)
+                    bot.send_message(chat_id, "Модель временно не ответила, пробую другую. Ещё немного...")
                 except Exception:
                     pass
+    
+    return "К сожалению, в данный момент вычислительные мощности недоступны. Пожалуйста, повторите запрос позже."
+
+def generate_vision_response(chat_id: int, prompt_text: str, base64_images: List[str]) -> str:
+    """Генерация ответов на основе мультимодального анализа (Vision)."""
+    content = [{"type": "text", "text": prompt_text}]
+    for b64 in base64_images:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+        })
+
+    messages = [{"role": "user", "content": content}]
+
+    for model_name in VISION_MODELS:
+        try:
+            print(f"[VISION] Инициализация анализа изображений. Модель: {model_name}")
+            response = groq_client.chat.completions.create(
+                messages=messages,
+                model=model_name,
+                temperature=0.4,
+                max_tokens=1500,
+                timeout=35.0
+            )
+            answer = response.choices[0].message.content
+            print(f"[VISION] Визуальный анализ завершен: {model_name}")
+            return clean_answer(answer)
+        except Exception as e:
+            print(f"[VISION] Сбой Vision-модели {model_name}: {e}")
+            if model_name != VISION_MODELS[-1]:
                 try:
-                    send_long_message(chat_id, answer, reply_to_message_id=message.message_id)
+                    bot.send_message(chat_id, "Оптический модуль временно занят, переключаюсь на резервный...")
                 except Exception:
-                    bot.reply_to(message, answer)
-                print(f"[VISION] Успешно: {model}", flush=True)
-                return
-            except Exception as e:
-                last_error = e
-                print(f"[VISION] ОШИБКА МОДЕЛИ {model}", flush=True)
-                print(repr(e), flush=True)
-                traceback.print_exc()
-                if index + 1 < len(vision_models):
-                    print("[VISION] Переключаюсь на следующую модель...", flush=True)
-        print("[VISION] Все vision-модели завершились ошибкой.", flush=True)
-        if last_error:
-            print(repr(last_error), flush=True)
-        bot.reply_to(message, "⚠️ Не получилось проанализировать изображение. Попробуй отправить его ещё раз.")
-    except Exception as e:
-        print("[PHOTO] КРИТИЧЕСКАЯ ОШИБКА:", repr(e), flush=True)
-        traceback.print_exc()
-        bot.reply_to(message, "⚠️ Произошла ошибка при обработке фотографии.")
+                    pass
+    
+    return "Произошел сбой при визуальном анализе файла. Возможно, изображение повреждено или сервис перегружен."
 
-# ============================================================
-# HEIC conversion
-# ============================================================
+def transcribe_audio(file_path: str) -> Optional[str]:
+    """Транскрибация аудио с использованием Whisper API."""
+    for model_name in AUDIO_MODELS:
+        try:
+            print(f"[AUDIO] Запуск транскрибации. Модель: {model_name}")
+            with open(file_path, "rb") as file:
+                transcription = groq_client.audio.transcriptions.create(
+                    file=(file_path, file.read()),
+                    model=model_name,
+                    prompt="Распознай русскую речь.",
+                    response_format="text",
+                    language="ru"
+                )
+            print(f"[AUDIO] Транскрибация успешна: {model_name}")
+            return transcription
+        except Exception as e:
+            print(f"[AUDIO] Ошибка распознавания речи {model_name}: {e}")
+    return None
 
-def convert_heic_to_jpeg(input_path: str, output_path: str) -> str:
-    try:
-        import pyheif
-        from PIL import Image
-        heif_file = pyheif.read(input_path)
-        image = Image.frombytes(heif_file.mode, heif_file.size, heif_file.data, "raw", heif_file.mode, heif_file.stride)
-        image.save(output_path, "JPEG", quality=90)
-        return output_path
-    except Exception as e:
-        print("[HEIC] Ошибка конвертации:", repr(e))
-        raise
+def clean_answer(text: str) -> str:
+    """Санитаризация вывода LLM от избыточных символов Markdown."""
+    # Удаление тройных и двойных декоративных звездочек, используемых моделями для выделения
+    text = re.sub(r'\*\*\*(.*?)\*\*\*', r'\1', text)
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    # Очистка от избыточных Markdown-заголовков (###), оставляя текст
+    text = re.sub(r'^###\s+', '', text, flags=re.MULTILINE)
+    # Удаление горизонтальных линий и прочего спама
+    text = re.sub(r'\*{3,}', '', text)
+    return text.strip()
 
-# ============================================================
-# DOCUMENT handler (replaced) — handles HEIC and video docs too
-# ============================================================
+def send_long_message(chat_id: int, text: str):
+    """Фрагментация ответа для соблюдения ограничений API Telegram (4096 символов)."""
+    max_length = 4000
+    for i in range(0, len(text), max_length):
+        bot.send_message(chat_id, text[i:i+max_length])
 
-@bot.message_handler(content_types=["document"])
-def handle_document(message):
-    chat_id = message.chat.id
-    try:
-        bot.send_chat_action(chat_id, "typing")
-        document = message.document
-        filename = document.file_name or "file"
-        extension = Path(filename).suffix.lower()
-        print(f"[FILE] Получен файл: {filename}")
-        file_info = bot.get_file(document.file_id)
-        file_bytes = bot.download_file(file_info.file_path)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            original_path = Path(temp_dir) / filename
-            with open(original_path, "wb") as f:
-                f.write(file_bytes)
-            # HEIC / HEIF
-            if extension in (".heic", ".heif"):
-                jpeg_path = Path(temp_dir) / "converted.jpg"
-                convert_heic_to_jpeg(str(original_path), str(jpeg_path))
-                with open(jpeg_path, "rb") as f:
-                    image_bytes = f.read()
-                encoded_image = base64.b64encode(image_bytes).decode("utf-8")
-                caption = (message.caption.strip() if message.caption else "Проанализируй изображение и подробно ответь на русском языке.")
-                vision_models = get_vision_models()
-                if not vision_models:
-                    bot.reply_to(message, "⚠️ Нет доступной модели для анализа HEIC.")
-                    return
-                vision_messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": caption},
-                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + encoded_image}}
-                    ]}
+# ==========================================
+# 4. КОНВЕЙЕРЫ ОБРАБОТКИ МУЛЬТИМЕДИА
+# ==========================================
+def process_image(file_info, downloaded_file, file_extension: str) -> Optional[str]:
+    """Декодирование HEIC/JPEG/PNG, нормализация и кодирование в Base64."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_path = os.path.join(temp_dir, f"input{file_extension}")
+        with open(input_path, 'wb') as f:
+            f.write(downloaded_file)
+            
+        try:
+            img = Image.open(input_path)
+            # Конвертация цветовых пространств с альфа-каналом (RGBA/CMYK) в стандартный RGB
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+                
+            # Жесткое лимитирование разрешения для Llama 3.2 Vision (max 1120x1120)
+            img.thumbnail((1120, 1120))
+            
+            output_path = os.path.join(temp_dir, "optimized.jpg")
+            img.save(output_path, "JPEG", quality=85)
+            
+            with open(output_path, "rb") as f:
+                return base64.b64encode(f.read()).decode('utf-8')
+        except Exception as e:
+            print(f"[IMAGE_PROCESSOR] Ошибка растеризации изображения: {e}")
+            return None
+
+def extract_video_frames(video_path: str, num_frames=6) -> List[str]:
+    """Многопоточное извлечение репрезентативных кадров видеопотока через FFmpeg."""
+    frames_b64 = []
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            # Получение точного хронометража медиаконтейнера
+            probe_cmd = [
+                "ffprobe", "-v", "error", "-show_entries",
+                "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", video_path
+            ]
+            result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            duration = float(result.stdout.strip())
+            
+            if duration <= 0:
+                raise ValueError("Сбой парсинга хронометража.")
+
+            # Расчет временных меток для равномерного покрытия
+            intervals = [duration * i / (num_frames + 1) for i in range(1, num_frames + 1)]
+            
+            for i, ts in enumerate(intervals):
+                frame_path = os.path.join(temp_dir, f"frame_{i}.jpg")
+                # Извлечение одного кадра, понижение качества (q:v 2) и масштабирование по высоте до 720p
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y", "-ss", str(ts), "-i", video_path,
+                    "-vframes", "1", "-q:v", "2", "-vf", "scale=-1:720", frame_path
                 ]
-                for model in vision_models:
-                    try:
-                        print(f"[HEIC] Пробую {model}")
-                        completion = groq_client.chat.completions.create(model=model, messages=vision_messages, max_tokens=MAX_OUTPUT_TOKENS, temperature=0.5)
-                        answer = completion.choices[0].message.content.strip()
-                        answer = clean_answer(answer)
-                        try:
-                            add_message(chat_id, "user", "[Пользователь отправил HEIC]\n" + caption)
-                            add_message(chat_id, "assistant", answer)
-                        except Exception:
-                            pass
-                        send_long_message(chat_id, answer, message.message_id)
-                        return
-                    except Exception as e:
-                        print(f"[HEIC] Ошибка {model}: {repr(e)}")
-                        traceback.print_exc()
-                bot.reply_to(message, "⚠️ Не удалось проанализировать HEIC.")
-                return
-            # Видео как документы
-            if extension in (".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpeg", ".mpg"):
-                process_video_message(message, document.file_id, message.caption)
-                return
-            # Обычные документы
-            extracted_text = file_parser.parse_file(str(original_path), extension.lstrip('.'))
-            if not extracted_text.strip():
-                bot.reply_to(message, "⚠️ Не удалось извлечь содержимое файла.")
-                return
-            max_document_chars = 50000
-            if len(extracted_text) > max_document_chars:
-                extracted_text = extracted_text[:max_document_chars] + "\n\n[Документ был сокращён из-за ограничения размера.]"
-            if message.caption:
-                prompt = (f"Пользователь отправил файл {filename}.\n\nЗапрос пользователя:\n{message.caption}\n\nСодержимое файла:\n{extracted_text}")
-            else:
-                prompt = (f"Пользователь отправил файл {filename}.\n\nПроанализируй его содержимое. Если это документ с текстом, сделай содержательный анализ. Отвечай на русском языке.\n\nСодержимое:\n{extracted_text}")
-            answer = generate_response(chat_id, prompt)
-            try:
-                send_long_message(chat_id, answer, message.message_id)
-            except Exception:
-                bot.reply_to(message, answer)
-    except Exception as e:
-        print("[FILE] ОШИБКА:", repr(e))
-        traceback.print_exc()
-        bot.reply_to(message, "⚠️ Не удалось обработать этот файл.")
+                subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
+                if os.path.exists(frame_path):
+                    with open(frame_path, "rb") as f:
+                        frames_b64.append(base64.b64encode(f.read()).decode('utf-8'))
+                        
+        except Exception as e:
+            print(f"[FFMPEG] Ошибка конвейера извлечения кадров: {e}")
+            
+    return frames_b64
 
-# ============================================================
-# VIDEO processing (ffmpeg)
-# ============================================================
+# ==========================================
+# 5. ИНТЕРФЕЙС ТЕЛЕГРАМ-СОБЫТИЙ (HANDLERS)
+# ==========================================
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    bot.reply_to(message, "Система инициализирована. Ожидаю ввод текстовых запросов, документов, изображений или медиафайлов для анализа.")
 
-def extract_video_frames(video_path: str, output_dir: str, max_frames: int = 6):
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    probe = subprocess.run([
-        "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", video_path
-    ], capture_output=True, text=True)
-    if probe.returncode != 0:
-        raise RuntimeError("Не удалось определить длительность видео.")
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+    print(f"[TELEGRAM_ROUTER] Текстовый запрос от {message.chat.id}")
     try:
-        duration = float(probe.stdout.strip())
-    except Exception:
-        duration = 0
-    if duration <= 0:
-        raise RuntimeError("Некорректная длительность видео.")
-    frame_count = min(max_frames, max(1, int(duration)))
-    frames = []
-    for i in range(frame_count):
-        timestamp = 0 if frame_count == 1 else (duration * i / (frame_count - 1))
-        output_file = output_dir / f"frame_{i}.jpg"
-        result = subprocess.run([
-            "ffmpeg", "-y", "-ss", str(timestamp), "-i", video_path, "-frames:v", "1", "-q:v", "2", str(output_file)
-        ], capture_output=True)
-        if result.returncode == 0 and output_file.exists():
-            frames.append(str(output_file))
-    return frames
-
-
-def process_video_message(message, file_id, caption):
-    chat_id = message.chat.id
-    try:
-        bot.send_chat_action(chat_id, "typing")
-        print("[VIDEO] Начинаю обработку видео...")
-        file_info = bot.get_file(file_id)
-        video_bytes = bot.download_file(file_info.file_path)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            video_path = Path(temp_dir) / "video"
-            with open(video_path, "wb") as f:
-                f.write(video_bytes)
-            frames_dir = Path(temp_dir) / "frames"
-            frames = extract_video_frames(str(video_path), str(frames_dir), max_frames=6)
-            if not frames:
-                bot.reply_to(message, "⚠️ Не удалось получить кадры видео.")
-                return
-            vision_models = get_vision_models()
-            if not vision_models:
-                bot.reply_to(message, "⚠️ Нет доступной модели для анализа видео.")
-                return
-            request = (caption.strip() if caption else "Проанализируй видео по представленным кадрам. Опиши, что происходит, важные события, объекты и действия. Отвечай на русском языке.")
-            content = [{"type": "text", "text": request}]
-            for frame_path in frames:
-                with open(frame_path, "rb") as f:
-                    frame_bytes = f.read()
-                encoded = base64.b64encode(frame_bytes).decode("utf-8")
-                content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + encoded}})
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": content}]
-            for model in vision_models:
-                try:
-                    print(f"[VIDEO] Пробую модель {model}")
-                    completion = groq_client.chat.completions.create(model=model, messages=messages, max_tokens=MAX_OUTPUT_TOKENS, temperature=0.5)
-                    answer = completion.choices[0].message.content.strip()
-                    answer = clean_answer(answer)
-                    try:
-                        add_message(chat_id, "user", "[Пользователь отправил видео]\n" + request)
-                        add_message(chat_id, "assistant", answer)
-                    except Exception:
-                        pass
-                    send_long_message(chat_id, answer, message.message_id)
-                    print(f"[VIDEO] Успешно: {model}")
-                    return
-                except Exception as e:
-                    print(f"[VIDEO] ОШИБКА {model}: {repr(e)}")
-                    traceback.print_exc()
-            bot.reply_to(message, "⚠️ Не удалось проанализировать видео.")
+        add_message(message.chat.id, "user", message.text)
+        bot.send_chat_action(message.chat.id, 'typing')
+        
+        answer = generate_response(message.chat.id)
+        
+        add_message(message.chat.id, "assistant", answer)
+        send_long_message(message.chat.id, answer)
     except Exception as e:
-        print("[VIDEO] КРИТИЧЕСКАЯ ОШИБКА:", repr(e))
-        traceback.print_exc()
-        bot.reply_to(message, "⚠️ Произошла ошибка при обработке видео.")
+        print(f"[TEXT_HANDLER] Сбой обработки: {e}")
+        bot.send_message(message.chat.id, "Внутренняя системная ошибка маршрутизации текста.")
 
-@bot.message_handler(content_types=["video"])
-def handle_video(message):
-    process_video_message(message, message.video.file_id, message.caption)
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
+    print(f"[TELEGRAM_ROUTER] Вектор/Изображение от {message.chat.id}")
+    try:
+        bot.send_chat_action(message.chat.id, 'upload_photo')
+        # Получение изображения максимального разрешения из массива
+        file_info = bot.get_file(message.photo[-1].file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        b64_image = process_image(file_info, downloaded_file, ".jpg")
+        if not b64_image:
+            bot.reply_to(message, "Ошибка буферизации графического контента.")
+            return
 
-# ============================================================
-# AUDIO / OTHER handlers (placeholders)
-# ============================================================
+        prompt_text = message.caption if message.caption else "Выполни детализированный оптический анализ предоставленного изображения. Пиши на русском."
+        add_message(message.chat.id, "user", f"[Отправлен визуальный контент] {message.caption or ''}")
+        
+        answer = generate_vision_response(message.chat.id, prompt_text, [b64_image])
+        
+        add_message(message.chat.id, "assistant", answer)
+        send_long_message(message.chat.id, answer)
+        
+    except Exception as e:
+        print(f"[PHOTO_HANDLER] Ошибка: {e}")
+        bot.reply_to(message, "Критический сбой пайплайна обработки фото.")
 
-@bot.message_handler(content_types=["voice", "audio"]) 
+@bot.message_handler(content_types=['voice', 'audio'])
 def handle_audio(message):
-    bot.reply_to(message, "🎤 Обработка аудио пока не подключена.")
+    print(f"[TELEGRAM_ROUTER] Аудио/Голосовое от {message.chat.id}")
+    try:
+        bot.send_chat_action(message.chat.id, 'record_audio')
+        file_id = message.voice.file_id if message.content_type == 'voice' else message.audio.file_id
+        file_info = bot.get_file(file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        ext = os.path.splitext(file_info.file_path)[1] or ".ogg"
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = os.path.join(temp_dir, f"audio{ext}")
+            with open(audio_path, 'wb') as f:
+                f.write(downloaded_file)
+            
+            bot.reply_to(message, "Инициирована акустическая транскрибация...")
+            transcribed_text = transcribe_audio(audio_path)
+            
+            if not transcribed_text:
+                bot.reply_to(message, "Сбой нейросетевого модуля распознавания речи.")
+                return
+                
+            # Интеграция полученного текста в обычный текстовый пайплайн
+            add_message(message.chat.id, "user", f"[Голосовое сообщение]: {transcribed_text}")
+            answer = generate_response(message.chat.id)
+            
+            add_message(message.chat.id, "assistant", answer)
+            send_long_message(message.chat.id, f"Распознано: _{transcribed_text}_\n\n{answer}")
 
-@bot.message_handler(content_types=["sticker", "contact", "location", "venue", "animation", "video_note"]) 
-def handle_other(message):
-    bot.reply_to(message, "⚠️ Этот тип контента пока не поддерживается.")
+    except Exception as e:
+        print(f"[AUDIO_HANDLER] Ошибка обработки аудио: {e}")
+        bot.reply_to(message, "Не удалось обработать аудиодорожку.")
 
-# ============================================================
-# MAIN
-# ============================================================
+@bot.message_handler(content_types=['document', 'video'])
+def handle_document_and_video(message):
+    print(f"[TELEGRAM_ROUTER] Документ/Медиаконтейнер от {message.chat.id}")
+    try:
+        if message.content_type == 'video':
+            file_id = message.video.file_id
+            filename = message.video.file_name or "video.mp4"
+            file_size = message.video.file_size
+            bot.send_chat_action(message.chat.id, 'record_video')
+        else:
+            file_id = message.document.file_id
+            filename = message.document.file_name or "file.unknown"
+            file_size = message.document.file_size
+            bot.send_chat_action(message.chat.id, 'upload_document')
+
+        # Ограничение физического размера файла (Telegram API лимит 20 MB для стандартного клиента)
+        if file_size > 20 * 1024 * 1024:
+            bot.reply_to(message, "Размер бинарного объекта превышает протокольный лимит платформы (20 МБ).")
+            return
+
+        ext = os.path.splitext(filename)[1].lower()
+        file_info = bot.get_file(file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        # Инъекция логики обработки HEIC/HEIF
+        if ext in ['.heic', '.heif']:
+            b64_image = process_image(file_info, downloaded_file, ext)
+            prompt_text = message.caption if message.caption else "Проанализируй данное HEIC-изображение."
+            add_message(message.chat.id, "user", f"[HEIC Контейнер] {message.caption or ''}")
+            answer = generate_vision_response(message.chat.id, prompt_text, [b64_image])
+            add_message(message.chat.id, "assistant", answer)
+            send_long_message(message.chat.id, answer)
+            return
+            
+        # Маршрутизатор видеопотоков
+        video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.mpeg', '.mpg']
+        if ext in video_extensions or message.content_type == 'video':
+            with tempfile.TemporaryDirectory() as temp_dir:
+                video_path = os.path.join(temp_dir, f"video{ext}")
+                with open(video_path, 'wb') as f:
+                    f.write(downloaded_file)
+                
+                bot.reply_to(message, "Медиафайл загружен. Идет демультиплексирование и извлечение кадров...")
+                frames = extract_video_frames(video_path, num_frames=6)
+                
+                if not frames:
+                    bot.reply_to(message, "Модуль FFmpeg не смог извлечь матрицу кадров.")
+                    return
+                    
+                prompt_text = message.caption if message.caption else "Перед тобой раскадровка видеоряда. Проанализируй динамику, объекты и смысл."
+                add_message(message.chat.id, "user", f"[Отправлен видеопоток: {filename}] {message.caption or ''}")
+                
+                print(f"[VIDEO_PIPELINE] Векторизовано {len(frames)} кадров. Вызов Vision-модели.")
+                answer = generate_vision_response(message.chat.id, prompt_text, frames)
+                
+                add_message(message.chat.id, "assistant", answer)
+                send_long_message(message.chat.id, answer)
+            return
+
+        # Маршрутизатор статических документов
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = os.path.join(temp_dir, filename)
+            with open(file_path, 'wb') as f:
+                f.write(downloaded_file)
+                
+            print(f"[DOC_PIPELINE] Вызов подсистемы парсинга для {filename}")
+            extracted_text = parse_file(file_path, filename)
+            
+            instruction = message.caption if message.caption else "Внимательно изучи предоставленный документ и выдели главную мысль."
+            add_message(message.chat.id, "user", f"[Документ: {filename}]\nДиректива: {instruction}\n\nТранскрипция:\n{extracted_text}")
+            
+            answer = generate_response(message.chat.id)
+            
+            add_message(message.chat.id, "assistant", answer)
+            send_long_message(message.chat.id, answer)
+
+    except Exception as e:
+        print(f"[FILE_HANDLER] Глобальный сбой обработки потока: {e}")
+        bot.reply_to(message, "Ошибка десериализации или анализа бинарного файла.")
+
+# ==========================================
+# 6. ЖИЗНЕННЫЙ ЦИКЛ ПОДКЛЮЧЕНИЯ И ЗАПУСК
+# ==========================================
+def check_telegram_token():
+    """Верификация токена и очистка стейта перед стартом."""
+    try:
+        me = bot.get_me()
+        print(f"[SYSTEM_BOOT] Fast Answer Bot Architecture Initialization")
+        print(f"[API_GATEWAY] Токен валиден. Идентификатор: @{me.username}")
+        # Принудительный сброс Webhook для подготовки к режиму Long Polling
+        bot.remove_webhook()
+        print(f"[API_GATEWAY] Webhook кэш очищен.")
+        return True
+    except Exception as e:
+        print(f"[FATAL_ERROR] Сбой аутентификации Telegram API: {e}")
+        return False
 
 def main():
+    if not check_telegram_token():
+        return
+        
     load_histories()
-    print("🚀 Fast Answer запущен (Long Polling)")
-    bot.remove_webhook()
-    time.sleep(1)
-    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+    print("[NETWORK] Протокол Long Polling активирован.")
+    
+    # Главный цикл событий
+    while True:
+        try:
+            # Параметр none_stop=True игнорирует локальные таймауты
+            bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
+        except ApiTelegramException as e:
+            if e.error_code == 409:
+                print(f"[NETWORK_EXCEPTION] 409 Conflict: Зафиксирована коллизия процессов. Активация Exponential Backoff (15 сек)...")
+                time.sleep(15)
+            elif e.error_code == 401:
+                print(f"[FATAL_ERROR] 401 Unauthorized: Токен отозван сервером. Немедленная остановка.")
+                break
+            elif e.error_code == 429:
+                print(f"[NETWORK_EXCEPTION] 429 Too Many Requests: Троттлинг на стороне сервера. Ожидание 30 сек...")
+                time.sleep(30)
+            else:
+                print(f"[API_EXCEPTION] Необработанная ошибка Telegram: {e}")
+                time.sleep(5)
+        except httpx.ReadTimeout:
+             print("[NETWORK_EXCEPTION] Таймаут сокета. Инициирована переустановка соединения...")
+             time.sleep(3)
+        except Exception as e:
+            print(f"[SYSTEM_EXCEPTION] Неожиданный сбой в главном потоке: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
