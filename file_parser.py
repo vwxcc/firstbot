@@ -99,7 +99,8 @@ def _parse_txt(file_path: str) -> str:
         raw_data = f.read()
         detected = chardet.detect(raw_data)
         encoding = detected['encoding'] or 'utf-8'
-    return raw_data.decode(encoding, errors='replace')import os
+    return raw_data.decode(encoding, errors='replace')
+import os
 import csv
 import chardet
 from io import BytesIO
