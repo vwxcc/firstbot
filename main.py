@@ -1,11 +1,20 @@
 import os
-import json
 import re
+import io
+import json
+import time
+import base64
+import sqlite3
+import logging
+import tempfile
 import traceback
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
-import requests
+import httpx
 import telebot
+from telebot import types
+
+import file_parser
 
 
 # ============================================================
@@ -15,33 +24,62 @@ import telebot
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CVC_API_KEY = os.getenv("CVC_API_KEY")
 
-# OpenAI-compatible API сайта
-BASE_URL = "https://ai.starimg.ru/v1"
+API_BASE = os.getenv(
+    "CVC_BASE_URL",
+    "https://ai.starimg.ru/v1"
+).rstrip("/")
 
-# Основная модель
-MODEL = os.getenv(
-    "MODEL",
-    "cheapvibecode/claude-sonnet-4-6"
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+
+DEFAULT_USER_LIMIT = int(os.getenv("USER_LIMIT", "20000"))
+DEFAULT_SUB_LIMIT = int(os.getenv("SUB_LIMIT", "200000"))
+
+HISTORY_MAX_MESSAGES = int(
+    os.getenv("HISTORY_MAX_MESSAGES", "20")
 )
 
-# Модель для сжатия истории
-SUMMARY_MODEL = os.getenv(
-    "SUMMARY_MODEL",
-    "cheapvibecode/claude-haiku-4-5"
+HISTORY_MAX_CHARS = int(
+    os.getenv("HISTORY_MAX_CHARS", "30000")
 )
 
-# После такого количества сообщений пользователя
-# запускается сжатие истории.
-COMPRESS_EVERY = 12
+SUMMARY_TRIGGER_MESSAGES = int(
+    os.getenv("SUMMARY_TRIGGER_MESSAGES", "16")
+)
 
-# После сжатия сохраняем последние сообщения.
-KEEP_LAST_MESSAGES = 8
+MAX_OUTPUT_TOKENS = int(
+    os.getenv("MAX_OUTPUT_TOKENS", "4096")
+)
 
-# Лимит Telegram
-TELEGRAM_LIMIT = 4000
 
-# Таймаут запроса к AI
-REQUEST_TIMEOUT = 180
+MODELS = [
+    "cheapvibecode/claude-fable-5",
+    "cheapvibecode/claude-opus-5",
+    "cheapvibecode/claude-sonnet-5",
+]
+
+MODEL_NAMES = {
+    "cheapvibecode/claude-fable-5": "Claude Fable 5",
+    "cheapvibecode/claude-opus-5": "Claude Opus 5",
+    "cheapvibecode/claude-sonnet-5": "Claude Sonnet 5",
+}
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("fast-answer")
 
 
 # ============================================================
@@ -50,19 +88,12 @@ REQUEST_TIMEOUT = 180
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "Не задана переменная BOT_TOKEN"
+        "BOT_TOKEN не задан в Environment Variables"
     )
 
 if not CVC_API_KEY:
     raise RuntimeError(
-        "Не задана переменная CVC_API_KEY"
-    )
-
-if not CVC_API_KEY.startswith("sk-"):
-    print(
-        "[WARNING] CVC_API_KEY обычно должен "
-        "начинаться с sk-",
-        flush=True
+        "CVC_API_KEY не задан в Environment Variables"
     )
 
 
@@ -77,348 +108,772 @@ bot = telebot.TeleBot(
 
 
 # ============================================================
+# DATABASE
+# ============================================================
+
+def db():
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False
+    )
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = db()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            model TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS summaries (
+            user_id INTEGER PRIMARY KEY,
+            content TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS usage (
+            user_id INTEGER PRIMARY KEY,
+            period_start INTEGER NOT NULL,
+            tokens INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id INTEGER PRIMARY KEY,
+            expires_at INTEGER NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        INSERT OR IGNORE INTO settings(key, value)
+        VALUES ('user_limit', ?)
+    """, (str(DEFAULT_USER_LIMIT),))
+
+    conn.execute("""
+        INSERT OR IGNORE INTO settings(key, value)
+        VALUES ('sub_limit', ?)
+    """, (str(DEFAULT_SUB_LIMIT),))
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+def get_setting(name, default):
+    conn = db()
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?",
+        (name,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return default
+
+    try:
+        return int(row["value"])
+    except Exception:
+        return default
+
+
+def set_setting(name, value):
+    conn = db()
+
+    conn.execute("""
+        INSERT INTO settings(key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key)
+        DO UPDATE SET value=excluded.value
+    """, (name, str(value)))
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# USERS
+# ============================================================
+
+def ensure_user(message):
+    user = message.from_user
+    now = int(time.time())
+
+    conn = db()
+
+    conn.execute("""
+        INSERT INTO users(
+            user_id,
+            username,
+            first_name,
+            model,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            updated_at=excluded.updated_at
+    """, (
+        user.id,
+        user.username or "",
+        user.first_name or "",
+        MODELS[2],
+        now,
+        now
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_model(user_id):
+    conn = db()
+
+    row = conn.execute(
+        "SELECT model FROM users WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
+
+    conn.close()
+
+    if not row:
+        return MODELS[2]
+
+    model = row["model"]
+
+    if model not in MODELS:
+        return MODELS[2]
+
+    return model
+
+
+def set_model(user_id, model):
+    if model not in MODELS:
+        return
+
+    conn = db()
+
+    conn.execute(
+        "UPDATE users SET model=?, updated_at=? WHERE user_id=?",
+        (model, int(time.time()), user_id)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# 6-HOUR PERIODS
+# ============================================================
+
+def current_period_start():
+    """
+    Фиксированный общий период.
+    00:00-06:00
+    06:00-12:00
+    12:00-18:00
+    18:00-00:00 UTC
+    """
+
+    now = int(time.time())
+
+    period = 6 * 60 * 60
+
+    return (now // period) * period
+
+
+def seconds_to_reset():
+    now = int(time.time())
+    period = 6 * 60 * 60
+    next_period = ((now // period) + 1) * period
+    return max(0, next_period - now)
+
+
+# ============================================================
+# SUBSCRIPTION
+# ============================================================
+
+def has_subscription(user_id):
+    conn = db()
+
+    row = conn.execute("""
+        SELECT expires_at
+        FROM subscriptions
+        WHERE user_id=?
+    """, (user_id,)).fetchone()
+
+    conn.close()
+
+    if not row:
+        return False
+
+    return row["expires_at"] > int(time.time())
+
+
+def subscription_expires(user_id):
+    conn = db()
+
+    row = conn.execute("""
+        SELECT expires_at
+        FROM subscriptions
+        WHERE user_id=?
+    """, (user_id,)).fetchone()
+
+    conn.close()
+
+    if not row:
+        return None
+
+    if row["expires_at"] <= int(time.time()):
+        return None
+
+    return row["expires_at"]
+
+
+def grant_subscription(user_id, days=1):
+    expires = int(time.time()) + days * 86400
+
+    conn = db()
+
+    conn.execute("""
+        INSERT INTO subscriptions(user_id, expires_at)
+        VALUES (?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET expires_at=excluded.expires_at
+    """, (user_id, expires))
+
+    conn.commit()
+    conn.close()
+
+    return expires
+
+
+# ============================================================
+# TOKEN LIMITS
+# ============================================================
+
+def get_limit(user_id):
+    if has_subscription(user_id):
+        return get_setting(
+            "sub_limit",
+            DEFAULT_SUB_LIMIT
+        )
+
+    return get_setting(
+        "user_limit",
+        DEFAULT_USER_LIMIT
+    )
+
+
+def get_usage(user_id):
+    period = current_period_start()
+
+    conn = db()
+
+    row = conn.execute("""
+        SELECT period_start, tokens
+        FROM usage
+        WHERE user_id=?
+    """, (user_id,)).fetchone()
+
+    if not row:
+        conn.execute("""
+            INSERT INTO usage(user_id, period_start, tokens)
+            VALUES (?, ?, 0)
+        """, (user_id, period))
+
+        conn.commit()
+        conn.close()
+
+        return 0
+
+    if row["period_start"] != period:
+        conn.execute("""
+            UPDATE usage
+            SET period_start=?, tokens=0
+            WHERE user_id=?
+        """, (period, user_id))
+
+        conn.commit()
+        conn.close()
+
+        return 0
+
+    tokens = row["tokens"]
+
+    conn.close()
+
+    return tokens
+
+
+def add_usage(user_id, tokens):
+    if tokens <= 0:
+        return
+
+    period = current_period_start()
+
+    conn = db()
+
+    conn.execute("""
+        INSERT INTO usage(user_id, period_start, tokens)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            period_start=excluded.period_start,
+            tokens=
+                CASE
+                    WHEN usage.period_start != excluded.period_start
+                    THEN excluded.tokens
+                    ELSE usage.tokens + excluded.tokens
+                END
+    """, (user_id, period, tokens))
+
+    conn.commit()
+    conn.close()
+
+
+def can_use(user_id):
+    used = get_usage(user_id)
+    limit = get_limit(user_id)
+
+    return used < limit
+
+
+# ============================================================
 # HISTORY
 # ============================================================
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
+def add_message(user_id, role, content):
+    conn = db()
 
-HISTORY_FILE = DATA_DIR / "history.json"
-
-histories = {}
-
-
-def load_histories():
-    global histories
-
-    if not HISTORY_FILE.exists():
-        histories = {}
-        return
-
-    try:
-        with open(
-            HISTORY_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-            histories = json.load(f)
-
-        print(
-            f"[HISTORY] Загружено чатов: "
-            f"{len(histories)}",
-            flush=True
+    conn.execute("""
+        INSERT INTO messages(
+            user_id,
+            role,
+            content,
+            created_at
         )
+        VALUES (?, ?, ?, ?)
+    """, (
+        user_id,
+        role,
+        content,
+        int(time.time())
+    ))
 
-    except Exception as e:
-        print(
-            "[HISTORY] Ошибка загрузки:",
-            repr(e),
-            flush=True
-        )
-
-        histories = {}
+    conn.commit()
+    conn.close()
 
 
-def save_histories():
-    temp_file = HISTORY_FILE.with_suffix(
-        ".tmp"
-    )
+def get_history(user_id):
+    conn = db()
 
-    try:
-        with open(
-            temp_file,
-            "w",
-            encoding="utf-8"
-        ) as f:
-            json.dump(
-                histories,
-                f,
-                ensure_ascii=False,
-                indent=2
+    rows = conn.execute("""
+        SELECT role, content
+        FROM messages
+        WHERE user_id=?
+        ORDER BY id ASC
+    """, (user_id,)).fetchall()
+
+    summary = conn.execute("""
+        SELECT content
+        FROM summaries
+        WHERE user_id=?
+    """, (user_id,)).fetchone()
+
+    conn.close()
+
+    result = []
+
+    if summary:
+        result.append({
+            "role": "user",
+            "content": (
+                "Краткое содержание предыдущего диалога:\n"
+                + summary["content"]
             )
+        })
 
-        temp_file.replace(
-            HISTORY_FILE
-        )
+    for row in rows:
+        result.append({
+            "role": row["role"],
+            "content": row["content"]
+        })
 
-    except Exception as e:
-        print(
-            "[HISTORY] Ошибка сохранения:",
-            repr(e),
-            flush=True
-        )
+    return result
 
 
-def get_history(chat_id):
-    chat_id = str(chat_id)
+def history_stats(user_id):
+    conn = db()
 
-    if chat_id not in histories:
-        histories[chat_id] = {
-            "summary": "",
-            "messages": [],
-            "user_message_count": 0
-        }
+    row = conn.execute("""
+        SELECT COUNT(*) AS count,
+               COALESCE(SUM(LENGTH(content)), 0) AS chars
+        FROM messages
+        WHERE user_id=?
+    """, (user_id,)).fetchone()
 
-    return histories[chat_id]
+    conn.close()
 
-
-def add_message(
-    chat_id,
-    role,
-    content
-):
-    history = get_history(chat_id)
-
-    history["messages"].append({
-        "role": role,
-        "content": content
-    })
-
-    if role == "user":
-        history["user_message_count"] += 1
-
-    save_histories()
+    return row["count"], row["chars"]
 
 
 # ============================================================
-# CLEAN ANSWER
+# API
 # ============================================================
+
+SYSTEM_PROMPT = """
+Ты — Fast Answer, русскоязычный AI-ассистент в Telegram.
+
+Отвечай преимущественно на русском языке.
+
+Отвечай понятно, конкретно и без лишнего оформления.
+
+Не используй огромное количество Markdown-звёздочек.
+Не превращай обычный ответ в жирный текст.
+Используй заголовки только когда они действительно нужны.
+
+Если пользователь просит создать файл, действительно подготовь данные
+в требуемом формате, а не говори, что это невозможно.
+
+Если пользователь прислал документ, анализируй его содержимое.
+
+Если информации недостаточно, прямо скажи, чего не хватает.
+
+Не утверждай, что создал файл, если файл фактически не был создан.
+"""
+
 
 def clean_answer(text):
     if not text:
-        return ""
+        return "Не удалось получить ответ."
 
-    text = str(text).strip()
+    text = str(text)
 
-    # Убираем Markdown-заголовки:
-    # ### Заголовок -> Заголовок
+    text = text.replace("###", "")
+    text = text.replace("##", "")
+    text = text.replace("**", "")
+    text = text.replace("__", "")
+
     text = re.sub(
-        r"(?m)^\s*#{1,6}\s+",
-        "",
-        text
-    )
-
-    # Убираем строки из одних звездочек
-    text = re.sub(
-        r"(?m)^\s*\*{2,}\s*$",
-        "",
-        text
-    )
-
-    # ***текст*** -> текст
-    text = re.sub(
-        r"\*\*\*(.*?)\*\*\*",
-        r"\1",
-        text,
-        flags=re.DOTALL
-    )
-
-    # **текст** -> текст
-    text = re.sub(
-        r"\*\*(.*?)\*\*",
-        r"\1",
-        text,
-        flags=re.DOTALL
-    )
-
-    # __текст__ -> текст
-    text = re.sub(
-        r"__(.*?)__",
-        r"\1",
-        text,
-        flags=re.DOTALL
-    )
-
-    # Убираем отдельные декоративные *
-    text = re.sub(
-        r"(?m)^\s*\*\s*$",
-        "",
-        text
-    )
-
-    # Не допускаем огромное количество пустых строк
-    text = re.sub(
-        r"\n{3,}",
+        r"\n{4,}",
         "\n\n",
+        text
+    )
+
+    text = re.sub(
+        r"[ \t]{2,}",
+        " ",
         text
     )
 
     return text.strip()
 
 
-# ============================================================
-# AI REQUEST
-# ============================================================
+def estimate_tokens(text):
+    if not text:
+        return 0
 
-def ai_request(
-    messages,
-    model,
-    temperature=0.5
-):
-    url = (
-        BASE_URL.rstrip("/")
-        + "/chat/completions"
+    # Грубая оценка, используется только до запроса.
+    return max(
+        1,
+        len(text) // 4
     )
+
+
+async def api_request(
+    model,
+    messages,
+    max_tokens=MAX_OUTPUT_TOKENS
+):
+    url = f"{API_BASE}/chat/completions"
 
     headers = {
         "Authorization": f"Bearer {CVC_API_KEY}",
         "Content-Type": "application/json",
-        "Accept": "application/json"
+        "Accept": "application/json",
     }
 
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": temperature
+        "max_tokens": max_tokens,
     }
 
-    print(
-        f"[AI] Модель: {model}",
-        flush=True
+    timeout = httpx.Timeout(
+        connect=30,
+        read=180,
+        write=60,
+        pool=30
     )
 
-    try:
-        response = requests.post(
+    async with httpx.AsyncClient(
+        timeout=timeout
+    ) as client:
+
+        response = await client.post(
             url,
             headers=headers,
-            json=payload,
-            timeout=REQUEST_TIMEOUT
+            json=payload
         )
 
-    except requests.RequestException as e:
-        print(
-            f"[AI ERROR] Ошибка соединения "
-            f"с моделью {model}:",
-            repr(e),
-            flush=True
-        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"HTTP {response.status_code}: "
+                f"{response.text[:1000]}"
+            )
 
-        raise
-
-    print(
-        f"[AI] HTTP {response.status_code} "
-        f"← {model}",
-        flush=True
-    )
-
-    if response.status_code >= 400:
-
-        print(
-            f"[MODEL ERROR] {model}",
-            flush=True
-        )
-
-        print(
-            response.text[:5000],
-            flush=True
-        )
-
-        raise RuntimeError(
-            f"Модель {model} вернула "
-            f"HTTP {response.status_code}"
-        )
-
-    try:
         data = response.json()
 
-    except Exception:
-        print(
-            "[AI ERROR] API вернул не JSON:",
-            response.text[:5000],
-            flush=True
-        )
-
+    if not data.get("choices"):
         raise RuntimeError(
-            "API вернул некорректный ответ"
+            f"API не вернул choices: {data}"
         )
 
-    try:
-        content = (
-            data["choices"][0]
-            ["message"]
-            ["content"]
-        )
+    choice = data["choices"][0]
 
-    except Exception:
-        print(
-            "[AI ERROR] Не удалось найти "
-            "choices[0].message.content",
-            flush=True
-        )
+    message = choice.get("message", {})
 
-        print(
-            json.dumps(
-                data,
-                ensure_ascii=False,
-                indent=2
-            )[:5000],
-            flush=True
-        )
+    content = message.get("content")
 
-        raise RuntimeError(
-            "Неизвестный формат ответа API"
-        )
-
-    # Некоторые API могут вернуть список
-    # частей вместо обычной строки.
     if isinstance(content, list):
-
         parts = []
 
         for item in content:
-
             if isinstance(item, dict):
-
                 if item.get("type") == "text":
-
-                    parts.append(
-                        item.get(
-                            "text",
-                            ""
-                        )
-                    )
+                    parts.append(item.get("text", ""))
 
         content = "\n".join(parts)
 
-    return str(content).strip()
+    if not content:
+        content = ""
+
+    usage = data.get("usage") or {}
+
+    total_tokens = usage.get("total_tokens")
+
+    if not isinstance(total_tokens, int):
+        total_tokens = (
+            usage.get("prompt_tokens", 0)
+            + usage.get("completion_tokens", 0)
+        )
+
+    return str(content), int(total_tokens or 0)
+
+
+def run_api(model, messages, max_tokens=MAX_OUTPUT_TOKENS):
+    import asyncio
+
+    return asyncio.run(
+        api_request(
+            model,
+            messages,
+            max_tokens
+        )
+    )
 
 
 # ============================================================
-# SYSTEM PROMPT
+# HISTORY COMPRESSION
 # ============================================================
 
-SYSTEM_PROMPT = """
-Ты AI-ассистент Telegram-бота.
+def compress_history(user_id):
+    history = get_history(user_id)
 
-Отвечай на русском языке, если пользователь
-не попросил другой язык.
+    if len(history) < 2:
+        return
 
-Отвечай непосредственно на вопрос.
+    dialog = []
 
-Не используй лишнее форматирование.
+    for message in history:
+        role = message["role"]
+        content = message["content"]
 
-Не окружай обычные предложения большим
-количеством звёздочек.
+        dialog.append(
+            f"{role}: {content}"
+        )
 
-Не добавляй ненужные вступления.
+    dialog_text = "\n\n".join(dialog)
 
-Используй контекст предыдущего разговора.
+    summary_prompt = """
+Сожми историю диалога.
 
-Если информации недостаточно, честно скажи об этом.
-Не выдумывай факты.
-""".strip()
+Сохрани:
+- факты, которые сообщил пользователь;
+- его цели;
+- важные решения;
+- предпочтения;
+- незавершённые задачи;
+- важный контекст;
+- результаты предыдущих действий.
+
+Удали:
+- повторы;
+- приветствия;
+- неважные детали;
+- лишнее оформление.
+
+Сделай компактное содержание на русском языке.
+"""
+
+    messages = [
+        {
+            "role": "system",
+            "content": summary_prompt
+        },
+        {
+            "role": "user",
+            "content": dialog_text
+        }
+    ]
+
+    summary_model = MODELS[0]
+
+    try:
+        summary, tokens = run_api(
+            summary_model,
+            messages,
+            max_tokens=1500
+        )
+
+        add_usage(
+            user_id,
+            tokens
+        )
+
+        conn = db()
+
+        conn.execute("""
+            INSERT INTO summaries(
+                user_id,
+                content,
+                updated_at
+            )
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                content=excluded.content,
+                updated_at=excluded.updated_at
+        """, (
+            user_id,
+            summary,
+            int(time.time())
+        ))
+
+        conn.execute(
+            "DELETE FROM messages WHERE user_id=?",
+            (user_id,)
+        )
+
+        conn.commit()
+        conn.close()
+
+        logger.info(
+            "History compressed: user=%s tokens=%s",
+            user_id,
+            tokens
+        )
+
+    except Exception as e:
+        logger.error(
+            "Ошибка сжатия истории: %s",
+            e
+        )
+
+
+def maybe_compress(user_id):
+    count, chars = history_stats(user_id)
+
+    if (
+        count >= SUMMARY_TRIGGER_MESSAGES
+        or chars >= HISTORY_MAX_CHARS
+    ):
+        compress_history(user_id)
 
 
 # ============================================================
-# BUILD CONTEXT
+# MODEL FALLBACK
 # ============================================================
 
-def build_messages(chat_id):
+def available_models_for_fallback(selected):
+    result = [selected]
 
-    history = get_history(chat_id)
+    for model in MODELS:
+        if model not in result:
+            result.append(model)
+
+    return result
+
+
+def generate_answer(user_id, user_text, attachments=None):
+    attachments = attachments or []
+
+    if not can_use(user_id):
+        used = get_usage(user_id)
+        limit = get_limit(user_id)
+        reset = seconds_to_reset()
+
+        hours = reset // 3600
+        minutes = (reset % 3600) // 60
+
+        return (
+            f"Лимит на текущие 6 часов исчерпан.\n\n"
+            f"Использовано: {used:,} / {limit:,} токенов.\n"
+            f"Следующий сброс через: {hours} ч. {minutes} мин."
+        ), None
+
+    history = get_history(user_id)
+
+    user_content = user_text
+
+    if attachments:
+        user_content += "\n\nПрикреплённые материалы:\n"
+
+        for attachment in attachments:
+            user_content += (
+                f"\n[{attachment.get('name', 'файл')}]\n"
+                f"{attachment.get('text', '')[:50000]}"
+            )
 
     messages = [
         {
@@ -427,331 +882,877 @@ def build_messages(chat_id):
         }
     ]
 
-    summary = history.get(
-        "summary",
-        ""
-    )
+    messages.extend(history)
 
-    if summary:
+    messages.append({
+        "role": "user",
+        "content": user_content
+    })
 
-        messages.append({
-            "role": "system",
-            "content":
-                "Краткая память предыдущей "
-                "части разговора:\n\n"
-                + summary
-        })
+    selected_model = get_model(user_id)
 
-    messages.extend(
-        history.get(
-            "messages",
-            []
-        )
-    )
+    errors = []
 
-    return messages
-
-
-# ============================================================
-# COMPRESS HISTORY
-# ============================================================
-
-def compress_chat(chat_id):
-
-    history = get_history(chat_id)
-
-    messages = history.get(
-        "messages",
-        []
-    )
-
-    if len(messages) <= KEEP_LAST_MESSAGES:
-        return
-
-    old_messages = messages[
-        :-KEEP_LAST_MESSAGES
-    ]
-
-    recent_messages = messages[
-        -KEEP_LAST_MESSAGES:
-    ]
-
-    old_parts = []
-
-    for message in old_messages:
-
-        if message["role"] == "user":
-            role = "Пользователь"
-        else:
-            role = "Ассистент"
-
-        old_parts.append(
-            f"{role}: "
-            f"{message['content']}"
-        )
-
-    old_text = "\n\n".join(
-        old_parts
-    )
-
-    previous_summary = history.get(
-        "summary",
-        ""
-    )
-
-    prompt = f"""
-Сделай компактное и точное резюме
-предыдущей части разговора.
-
-Предыдущее резюме:
-{previous_summary}
-
-Предыдущая часть диалога:
-{old_text}
-
-Сохрани только действительно важную
-информацию, которая может понадобиться
-для продолжения разговора:
-
-- цели пользователя;
-- важные факты;
-- числа;
-- названия;
-- принятые решения;
-- текущие задачи;
-- незавершённые задачи;
-- технический контекст;
-- важные предпочтения.
-
-Не выдумывай информацию.
-
-Не пересказывай каждое сообщение.
-
-Верни только компактную память
-на русском языке.
-""".strip()
-
-    print(
-        f"[HISTORY] Сжимаю историю "
-        f"чата {chat_id}",
-        flush=True
-    )
-
-    try:
-
-        summary = ai_request(
-            [
-                {
-                    "role": "system",
-                    "content":
-                        "Ты модуль памяти "
-                        "AI-ассистента. "
-                        "Создавай только точные "
-                        "и компактные резюме."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            model=SUMMARY_MODEL,
-            temperature=0.2
-        )
-
-        summary = clean_answer(
-            summary
-        )
-
-        if not summary:
-            raise RuntimeError(
-                "Модель вернула пустое резюме"
+    for model in available_models_for_fallback(
+        selected_model
+    ):
+        try:
+            logger.info(
+                "Запрос: user=%s model=%s",
+                user_id,
+                model
             )
 
-        # Удаляем старую часть только
-        # после успешного сжатия.
+            answer, tokens = run_api(
+                model,
+                messages
+            )
 
-        history["summary"] = summary
+            if not tokens:
+                tokens = (
+                    estimate_tokens(user_content)
+                    + estimate_tokens(answer)
+                )
 
-        history["messages"] = (
-            recent_messages
-        )
+            add_usage(
+                user_id,
+                tokens
+            )
 
-        save_histories()
+            add_message(
+                user_id,
+                "user",
+                user_content
+            )
 
-        print(
-            f"[HISTORY] История чата "
-            f"{chat_id} сжата успешно",
-            flush=True
-        )
+            add_message(
+                user_id,
+                "assistant",
+                answer
+            )
 
-    except Exception as e:
+            maybe_compress(user_id)
 
-        print(
-            f"[HISTORY ERROR] Чат "
-            f"{chat_id}:",
-            repr(e),
-            flush=True
-        )
+            return clean_answer(answer), model
 
-        traceback.print_exc()
+        except Exception as e:
+            error_text = str(e)
 
-        # При ошибке ничего не удаляем.
+            logger.error(
+                "Ошибка модели %s для user=%s: %s",
+                model,
+                user_id,
+                error_text
+            )
+
+            errors.append(
+                f"{model}: {error_text}"
+            )
+
+            continue
+
+    logger.error(
+        "Все модели завершились ошибкой:\n%s",
+        "\n".join(errors)
+    )
+
+    return (
+        "Небольшая техническая проблема: сейчас не удалось "
+        "получить ответ. Попробуй отправить запрос ещё раз через "
+        "несколько секунд.",
+        None
+    )
 
 
 # ============================================================
-# GENERATE RESPONSE
+# TELEGRAM HELPERS
 # ============================================================
 
-def generate_response(
-    chat_id,
-    user_text
-):
+def safe_send(chat_id, text):
+    text = clean_answer(text)
 
-    add_message(
-        chat_id,
-        "user",
-        user_text
-    )
+    # Telegram message limit
+    limit = 4000
 
-    history = get_history(
-        chat_id
-    )
-
-    count = history.get(
-        "user_message_count",
-        0
-    )
-
-    # Каждые 12 сообщений
-    if (
-        count > 0
-        and count % COMPRESS_EVERY == 0
-    ):
-        compress_chat(
-            chat_id
+    if len(text) <= limit:
+        return bot.send_message(
+            chat_id,
+            text
         )
 
-    messages = build_messages(
-        chat_id
-    )
-
-    answer = ai_request(
-        messages,
-        model=MODEL,
-        temperature=0.5
-    )
-
-    answer = clean_answer(
-        answer
-    )
-
-    if not answer:
-        raise RuntimeError(
-            "Модель вернула пустой ответ"
-        )
-
-    add_message(
-        chat_id,
-        "assistant",
-        answer
-    )
-
-    return answer
-
-
-# ============================================================
-# SEND LONG MESSAGE
-# ============================================================
-
-def send_long_message(
-    chat_id,
-    text,
-    reply_to=None
-):
-
-    text = text.strip()
-
-    if not text:
-        text = "Модель не вернула ответ."
-
-    first = True
+    parts = []
 
     while text:
+        parts.append(text[:limit])
+        text = text[limit:]
 
-        part = text[
-            :TELEGRAM_LIMIT
-        ]
-
-        if len(text) > TELEGRAM_LIMIT:
-
-            split_pos = part.rfind(
-                "\n"
-            )
-
-            if split_pos > 1000:
-                part = part[
-                    :split_pos
-                ]
-
-        kwargs = {}
-
-        if first and reply_to:
-
-            kwargs[
-                "reply_to_message_id"
-            ] = reply_to
-
+    for part in parts:
         bot.send_message(
             chat_id,
-            part,
-            **kwargs
+            part
         )
 
-        first = False
 
-        text = text[
-            len(part):
-        ]
+def model_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+
+    for model in MODELS:
+        keyboard.add(
+            types.InlineKeyboardButton(
+                MODEL_NAMES[model],
+                callback_data=f"model:{model}"
+            )
+        )
+
+    return keyboard
+
+
+def main_keyboard():
+    keyboard = types.ReplyKeyboardMarkup(
+        resize_keyboard=True
+    )
+
+    keyboard.row(
+        types.KeyboardButton("🤖 Модель"),
+        types.KeyboardButton("📊 Лимит")
+    )
+
+    keyboard.row(
+        types.KeyboardButton("ℹ️ Помощь")
+    )
+
+    return keyboard
 
 
 # ============================================================
 # /START
 # ============================================================
 
-@bot.message_handler(
-    commands=["start"]
-)
-def start_handler(message):
+@bot.message_handler(commands=["start"])
+def start(message):
+    ensure_user(message)
+
+    model = get_model(
+        message.from_user.id
+    )
+
+    text = (
+        "🚀 Fast Answer\n\n"
+        "Я AI-бот с поддержкой Claude.\n\n"
+        f"Текущая модель: {MODEL_NAMES.get(model, model)}\n\n"
+        "Можно отправлять:\n"
+        "• текст\n"
+        "• фото\n"
+        "• PDF\n"
+        "• DOCX\n"
+        "• XLSX\n"
+        "• PPTX\n"
+        "• CSV\n"
+        "• TXT\n"
+        "• HEIC/HEIF\n"
+        "• видео и MOV\n\n"
+        "Основные команды:\n"
+        "/model — выбрать модель\n"
+        "/limit — посмотреть лимит\n"
+        "/new — начать новый диалог\n"
+        "/help — помощь"
+    )
 
     bot.send_message(
         message.chat.id,
-        "Привет! Я готов отвечать на вопросы."
+        text,
+        reply_markup=main_keyboard()
     )
 
 
 # ============================================================
-# /CLEAR
+# /HELP
 # ============================================================
 
-@bot.message_handler(
-    commands=["clear"]
-)
-def clear_handler(message):
+@bot.message_handler(commands=["help"])
+def help_command(message):
+    ensure_user(message)
 
-    chat_id = str(
-        message.chat.id
+    text = (
+        "📖 Возможности\n\n"
+        "/model — переключение Claude\n"
+        "/limit — состояние лимита\n"
+        "/new — очистить текущую историю\n"
+        "/help — список команд\n\n"
+        "Файлы:\n"
+        "PDF, DOCX, XLSX, PPTX, CSV, TXT, HEIC, изображения,\n"
+        "видео и MOV можно отправлять прямо в чат.\n\n"
+        "Также можно попросить создать Excel, Word, PowerPoint "
+        "или другой файл."
     )
-
-    histories.pop(
-        chat_id,
-        None
-    )
-
-    save_histories()
 
     bot.send_message(
         message.chat.id,
-        "История этого чата очищена."
+        text
+    )
+
+
+# ============================================================
+# /MODEL
+# ============================================================
+
+@bot.message_handler(commands=["model"])
+def model_command(message):
+    ensure_user(message)
+
+    current = get_model(
+        message.from_user.id
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "Выбери модель:\n\n"
+        f"Сейчас: {MODEL_NAMES.get(current, current)}",
+        reply_markup=model_keyboard()
+    )
+
+
+# ============================================================
+# MODEL CALLBACK
+# ============================================================
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("model:")
+)
+def model_callback(call):
+    user_id = call.from_user.id
+
+    ensure_user(call.message)
+
+    model = call.data.split(
+        "model:",
+        1
+    )[1]
+
+    if model not in MODELS:
+        bot.answer_callback_query(
+            call.id,
+            "Неизвестная модель"
+        )
+        return
+
+    set_model(
+        user_id,
+        model
+    )
+
+    bot.answer_callback_query(
+        call.id,
+        "Модель переключена"
+    )
+
+    bot.edit_message_text(
+        "✅ Модель изменена.\n\n"
+        f"Текущая модель: {MODEL_NAMES[model]}",
+        call.message.chat.id,
+        call.message.message_id
+    )
+
+
+# ============================================================
+# /LIMIT
+# ============================================================
+
+@bot.message_handler(commands=["limit"])
+def limit_command(message):
+    ensure_user(message)
+
+    user_id = message.from_user.id
+
+    used = get_usage(user_id)
+    limit = get_limit(user_id)
+
+    subscription = has_subscription(user_id)
+
+    reset = seconds_to_reset()
+
+    hours = reset // 3600
+    minutes = (reset % 3600) // 60
+
+    text = (
+        "📊 Лимит\n\n"
+        f"Использовано: {used:,} токенов\n"
+        f"Доступно: {limit:,} токенов\n"
+        f"Осталось: {max(0, limit - used):,}\n\n"
+        f"Подписка: {'активна ⭐' if subscription else 'нет'}\n"
+        f"Сброс через: {hours} ч. {minutes} мин."
+    )
+
+    bot.send_message(
+        message.chat.id,
+        text
+    )
+
+
+# ============================================================
+# /NEW
+# ============================================================
+
+@bot.message_handler(commands=["new"])
+def new_command(message):
+    ensure_user(message)
+
+    user_id = message.from_user.id
+
+    conn = db()
+
+    conn.execute(
+        "DELETE FROM messages WHERE user_id=?",
+        (user_id,)
+    )
+
+    conn.execute(
+        "DELETE FROM summaries WHERE user_id=?",
+        (user_id,)
+    )
+
+    conn.commit()
+    conn.close()
+
+    bot.send_message(
+        message.chat.id,
+        "🧹 История текущего диалога очищена."
+    )
+
+
+# ============================================================
+# ADMIN
+# ============================================================
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+
+@bot.message_handler(commands=["admin"])
+def admin_command(message):
+    if not is_admin(message.from_user.id):
+        bot.send_message(
+            message.chat.id,
+            "Нет доступа."
+        )
+        return
+
+    user_limit = get_setting(
+        "user_limit",
+        DEFAULT_USER_LIMIT
+    )
+
+    sub_limit = get_setting(
+        "sub_limit",
+        DEFAULT_SUB_LIMIT
+    )
+
+    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.row(
+        types.InlineKeyboardButton(
+            "Изменить обычный лимит",
+            callback_data="admin:user_limit"
+        )
+    )
+
+    keyboard.row(
+        types.InlineKeyboardButton(
+            "Изменить лимит подписки",
+            callback_data="admin:sub_limit"
+        )
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "🔧 Админка\n\n"
+        f"Обычный лимит: {user_limit:,}\n"
+        f"Лимит подписки: {sub_limit:,}\n\n"
+        "Для выдачи подписки:\n"
+        "/grant ID\n"
+        "или\n"
+        "/grant ID ДНИ",
+        reply_markup=keyboard
+    )
+
+
+admin_waiting = {}
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin:")
+)
+def admin_callback(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(
+            call.id,
+            "Нет доступа"
+        )
+        return
+
+    setting = call.data.split(
+        "admin:",
+        1
+    )[1]
+
+    if setting == "user_limit":
+        admin_waiting[call.from_user.id] = "user_limit"
+
+        bot.send_message(
+            call.message.chat.id,
+            "Введи новый лимит обычного пользователя:"
+        )
+
+    elif setting == "sub_limit":
+        admin_waiting[call.from_user.id] = "sub_limit"
+
+        bot.send_message(
+            call.message.chat.id,
+            "Введи новый лимит подписчика:"
+        )
+
+    bot.answer_callback_query(call.id)
+
+
+# ============================================================
+# ADMIN LIMIT MESSAGE
+# ============================================================
+
+@bot.message_handler(
+    func=lambda message:
+        message.from_user.id in admin_waiting
+)
+def admin_limit_input(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    setting = admin_waiting.pop(
+        message.from_user.id
+    )
+
+    try:
+        value = int(
+            message.text.replace(
+                " ",
+                ""
+            )
+        )
+
+        if value <= 0:
+            raise ValueError
+
+    except Exception:
+        bot.send_message(
+            message.chat.id,
+            "Нужно указать положительное целое число."
+        )
+        return
+
+    set_setting(
+        setting,
+        value
+    )
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Лимит изменён: {value:,} токенов."
+    )
+
+
+# ============================================================
+# GRANT SUBSCRIPTION
+# ============================================================
+
+@bot.message_handler(commands=["grant"])
+def grant_command(message):
+    if not is_admin(message.from_user.id):
+        bot.send_message(
+            message.chat.id,
+            "Нет доступа."
+        )
+        return
+
+    parts = message.text.split()
+
+    if len(parts) < 2:
+        bot.send_message(
+            message.chat.id,
+            "Использование:\n"
+            "/grant TELEGRAM_ID\n"
+            "/grant TELEGRAM_ID ДНИ"
+        )
+        return
+
+    try:
+        user_id = int(parts[1])
+
+        days = 1
+
+        if len(parts) >= 3:
+            days = int(parts[2])
+
+        if days <= 0:
+            raise ValueError
+
+    except Exception:
+        bot.send_message(
+            message.chat.id,
+            "Неверный ID или количество дней."
+        )
+        return
+
+    expires = grant_subscription(
+        user_id,
+        days
+    )
+
+    date = datetime.fromtimestamp(
+        expires,
+        tz=timezone.utc
+    ).strftime(
+        "%d.%m.%Y %H:%M UTC"
+    )
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Подписка выдана.\n"
+        f"ID: {user_id}\n"
+        f"Срок: {days} дн.\n"
+        f"До: {date}"
+    )
+
+    try:
+        bot.send_message(
+            user_id,
+            "⭐ Тебе выдана подписка.\n\n"
+            f"Лимит теперь: "
+            f"{get_setting('sub_limit', DEFAULT_SUB_LIMIT):,} "
+            "токенов / 6 часов.\n"
+            f"Подписка действует до: {date}"
+        )
+    except Exception as e:
+        logger.warning(
+            "Не удалось уведомить пользователя %s: %s",
+            user_id,
+            e
+        )
+
+
+# ============================================================
+# HELPERS FOR FILES
+# ============================================================
+
+def download_telegram_file(file_id, suffix=""):
+    file_info = bot.get_file(file_id)
+
+    data = bot.download_file(
+        file_info.file_path
+    )
+
+    fd, path = tempfile.mkstemp(
+        suffix=suffix
+    )
+
+    os.close(fd)
+
+    with open(path, "wb") as f:
+        f.write(data)
+
+    return path
+
+
+def process_file(
+    file_path,
+    extension,
+    filename
+):
+    extension = extension.lower().lstrip(".")
+
+    try:
+        result = file_parser.parse_file(
+            file_path,
+            extension
+        )
+
+        if isinstance(result, dict):
+            return result
+
+        return {
+            "type": "text",
+            "text": result or "",
+            "name": filename
+        }
+
+    except Exception as e:
+        logger.error(
+            "Ошибка обработки %s: %s",
+            filename,
+            e
+        )
+
+        return {
+            "type": "error",
+            "text": (
+                f"Не удалось прочитать файл {filename}.\n"
+                f"Причина: {e}"
+            ),
+            "name": filename
+        }
+
+
+# ============================================================
+# DOCUMENTS
+# ============================================================
+
+@bot.message_handler(
+    content_types=["document"]
+)
+def handle_document(message):
+    ensure_user(message)
+
+    document = message.document
+
+    filename = document.file_name or "file"
+
+    extension = os.path.splitext(
+        filename
+    )[1]
+
+    try:
+        path = download_telegram_file(
+            document.file_id,
+            extension
+        )
+
+        parsed = process_file(
+            path,
+            extension,
+            filename
+        )
+
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+        if parsed["type"] == "error":
+            bot.reply_to(
+                message,
+                parsed["text"]
+            )
+            return
+
+        user_text = (
+            message.caption
+            or
+            f"Проанализируй файл {filename}."
+        )
+
+        answer, model = generate_answer(
+            message.from_user.id,
+            user_text,
+            [parsed]
+        )
+
+        bot.send_chat_action(
+            message.chat.id,
+            "typing"
+        )
+
+        safe_send(
+            message.chat.id,
+            answer
+        )
+
+    except Exception as e:
+        logger.error(
+            "Document error: %s\n%s",
+            e,
+            traceback.format_exc()
+        )
+
+        bot.reply_to(
+            message,
+            "Не удалось обработать файл."
+        )
+
+
+# ============================================================
+# PHOTO
+# ============================================================
+
+@bot.message_handler(
+    content_types=["photo"]
+)
+def handle_photo(message):
+    ensure_user(message)
+
+    try:
+        photo = message.photo[-1]
+
+        path = download_telegram_file(
+            photo.file_id,
+            ".jpg"
+        )
+
+        with open(path, "rb") as f:
+            encoded = base64.b64encode(
+                f.read()
+            ).decode()
+
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+        user_text = (
+            message.caption
+            or
+            "Проанализируй это изображение."
+        )
+
+        # Для API, поддерживающего OpenAI-style vision.
+        history = get_history(
+            message.from_user.id
+        )
+
+        content = [
+            {
+                "type": "text",
+                "text": user_text
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url":
+                        "data:image/jpeg;base64,"
+                        + encoded
+                }
+            }
+        ]
+
+        messages = [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            }
+        ]
+
+        messages.extend(history)
+
+        messages.append({
+            "role": "user",
+            "content": content
+        })
+
+        selected = get_model(
+            message.from_user.id
+        )
+
+        for model in available_models_for_fallback(
+            selected
+        ):
+            try:
+                answer, tokens = run_api(
+                    model,
+                    messages
+                )
+
+                if not tokens:
+                    tokens = estimate_tokens(
+                        user_text
+                    ) + estimate_tokens(answer)
+
+                add_usage(
+                    message.from_user.id,
+                    tokens
+                )
+
+                add_message(
+                    message.from_user.id,
+                    "user",
+                    user_text + "\n[Изображение]"
+                )
+
+                add_message(
+                    message.from_user.id,
+                    "assistant",
+                    answer
+                )
+
+                maybe_compress(
+                    message.from_user.id
+                )
+
+                safe_send(
+                    message.chat.id,
+                    answer
+                )
+
+                return
+
+            except Exception as e:
+                logger.error(
+                    "Ошибка vision модели %s: %s",
+                    model,
+                    e
+                )
+
+        bot.reply_to(
+            message,
+            "Не удалось обработать изображение. "
+            "Попробуй ещё раз."
+        )
+
+    except Exception as e:
+        logger.error(
+            "Photo error: %s\n%s",
+            e,
+            traceback.format_exc()
+        )
+
+        bot.reply_to(
+            message,
+            "Не удалось обработать изображение."
+        )
+
+
+# ============================================================
+# VIDEO / MOV
+# ============================================================
+
+@bot.message_handler(
+    content_types=["video"]
+)
+def handle_video(message):
+    ensure_user(message)
+
+    bot.reply_to(
+        message,
+        "🎬 Видео получено.\n\n"
+        "Сейчас я могу принять видеофайл, но для полноценного "
+        "анализа видео API должно поддерживать video input. "
+        "Если оно не поддерживается, отправь отдельные кадры "
+        "или аудиодорожку."
+    )
+
+
+# ============================================================
+# AUDIO
+# ============================================================
+
+@bot.message_handler(
+    content_types=["voice", "audio"]
+)
+def handle_audio(message):
+    ensure_user(message)
+
+    bot.reply_to(
+        message,
+        "🎧 Аудио получено.\n\n"
+        "Для расшифровки аудио нужен отдельный speech-to-text "
+        "endpoint. Текущий Claude endpoint используется для текста "
+        "и мультимодального анализа."
     )
 
 
@@ -762,52 +1763,83 @@ def clear_handler(message):
 @bot.message_handler(
     content_types=["text"]
 )
-def text_handler(message):
+def handle_text(message):
+    ensure_user(message)
 
-    if message.text.startswith("/"):
+    text = message.text.strip()
+
+    if not text:
         return
 
-    chat_id = message.chat.id
+    if text.startswith("/"):
+        return
 
-    print(
-        f"[TEXT] chat={chat_id}: "
-        f"{message.text[:300]}",
-        flush=True
+    if text == "🤖 Модель":
+        model_command(message)
+        return
+
+    if text == "📊 Лимит":
+        limit_command(message)
+        return
+
+    if text == "ℹ️ Помощь":
+        help_command(message)
+        return
+
+    bot.send_chat_action(
+        message.chat.id,
+        "typing"
     )
 
-    try:
+    answer, model = generate_answer(
+        message.from_user.id,
+        text
+    )
 
-        bot.send_chat_action(
-            chat_id,
-            "typing"
+    safe_send(
+        message.chat.id,
+        answer
+    )
+
+
+# ============================================================
+# OTHER
+# ============================================================
+
+@bot.message_handler(
+    content_types=[
+        "animation",
+        "sticker",
+        "contact",
+        "location",
+        "venue",
+        "video_note"
+    ]
+)
+def handle_other(message):
+    ensure_user(message)
+
+    bot.reply_to(
+        message,
+        "Этот тип сообщения пока не поддерживается напрямую."
+    )
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+class BotExceptionHandler(
+    telebot.ExceptionHandler
+):
+    def handle(self, exception):
+        logger.error(
+            "Telegram error: %s\n%s",
+            exception,
+            traceback.format_exc()
         )
 
-        answer = generate_response(
-            chat_id,
-            message.text
-        )
-
-        send_long_message(
-            chat_id,
-            answer,
-            message.message_id
-        )
-
-    except Exception as e:
-
-        print(
-            "[TEXT ERROR]",
-            repr(e),
-            flush=True
-        )
-
-        traceback.print_exc()
-
-        bot.send_message(
-            chat_id,
-            "Не получилось получить ответ "
-            "от модели. Попробуй ещё раз немного позже."
-        )
+        return True
 
 
 # ============================================================
@@ -815,104 +1847,40 @@ def text_handler(message):
 # ============================================================
 
 def main():
-
-    print(
-        "==========================================",
-        flush=True
+    logger.info(
+        "🚀 Fast Answer запущен"
     )
 
-    print(
-        "🚀 Fast Answer",
-        flush=True
+    logger.info(
+        "API: %s",
+        API_BASE
     )
 
-    print(
-        "🌐 API: https://ai.starimg.ru/v1",
-        flush=True
+    logger.info(
+        "Models: %s",
+        ", ".join(MODELS)
     )
 
-    print(
-        f"🤖 Main model: {MODEL}",
-        flush=True
-    )
-
-    print(
-        f"🧠 Summary model: {SUMMARY_MODEL}",
-        flush=True
-    )
-
-    print(
-        f"📦 Compression: every "
-        f"{COMPRESS_EVERY} user messages",
-        flush=True
-    )
-
-    print(
-        "🔑 CVC_API_KEY: задан",
-        flush=True
-    )
-
-    # ВАЖНО:
-    # CLAUDE2MLN1 здесь вообще не используется.
-
-    print(
-        "==========================================",
-        flush=True
-    )
-
-    load_histories()
-
-    # Проверяем Telegram
-
-    try:
-
-        me = bot.get_me()
-
-        print(
-            f"✅ Telegram подключён: "
-            f"@{me.username}",
-            flush=True
+    logger.info(
+        "User limit: %s",
+        get_setting(
+            "user_limit",
+            DEFAULT_USER_LIMIT
         )
-
-    except Exception as e:
-
-        print(
-            "❌ Telegram ERROR:",
-            repr(e),
-            flush=True
-        )
-
-        raise
-
-    # Убираем webhook,
-    # чтобы Long Polling работал корректно.
-
-    try:
-
-        bot.remove_webhook(
-            drop_pending_updates=True
-        )
-
-        print(
-            "✅ Webhook отключён",
-            flush=True
-        )
-
-    except Exception as e:
-
-        print(
-            "⚠️ Не удалось отключить webhook:",
-            repr(e),
-            flush=True
-        )
-
-    print(
-        "📡 Long Polling запущен",
-        flush=True
     )
+
+    logger.info(
+        "Subscription limit: %s",
+        get_setting(
+            "sub_limit",
+            DEFAULT_SUB_LIMIT
+        )
+    )
+
+    bot.remove_webhook()
 
     bot.infinity_polling(
-        skip_pending=False,
+        skip_pending=True,
         timeout=30,
         long_polling_timeout=30
     )
