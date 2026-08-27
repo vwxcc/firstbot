@@ -7,9 +7,21 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      # --- обязательные ---
       - key: BOT_TOKEN
         sync: false
+      # --- основной AI-провайдер (нужен хотя бы один текстовый) ---
       - key: GROQ_API_KEY
+        sync: false
+      # --- необязательные резервные провайдеры: если ключ не задан,
+      #     бот просто пропустит этого провайдера в цепочке fallback ---
+      - key: CEREBRAS_API_KEY
+        sync: false
+      - key: SAMBANOVA_API_KEY
+        sync: false
+      - key: MISTRAL_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
         sync: false
     disk:
       name: bot-history-data
