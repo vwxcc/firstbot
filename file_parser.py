@@ -1,302 +1,203 @@
 import os
 import csv
 import chardet
-import PyPDF2
-import docx
-import openpyxl
-
+from io import BytesIO
+from PyPDF2 import PdfReader
+from docx import Document
+from openpyxl import load_workbook
 from pptx import Presentation
 
+MAX_TEXT_LENGTH = 20000  # Жесткое ограничение для защиты контекстного окна LLM
 
-class ParseError(Exception):
-    pass
-
-
-def parse_pdf(file_path: str) -> str:
-
+def parse_file(file_path: str, filename: str) -> str:
+    """
+    Фасадная функция для извлечения текста из различных форматов.
+    Обеспечивает перехват исключений и предотвращает падение основного процесса.
+    """
+    ext = os.path.splitext(filename)[1].lower()
+    text = ""
+    
     try:
-
-        with open(file_path, "rb") as f:
-
-            reader = PyPDF2.PdfReader(f)
-
-            pages = []
-
-            for page in reader.pages:
-
-                text = page.extract_text()
-
-                if text:
-                    pages.append(text)
-
-            return "\n\n".join(pages).strip()
-
+        if ext == '.pdf':
+            text = _parse_pdf(file_path)
+        elif ext in ['.docx', '.doc']:
+            text = _parse_docx(file_path)
+        elif ext == '.xlsx':
+            text = _parse_xlsx(file_path)
+        elif ext == '.csv':
+            text = _parse_csv(file_path)
+        elif ext == '.pptx':
+            text = _parse_pptx(file_path)
+        elif ext == '.txt':
+            text = _parse_txt(file_path)
+        else:
+            return f"[Системное уведомление: Формат {ext} не поддерживается для прямого извлечения текста]"
+            
+        if not text or not text.strip():
+            return "[Системное уведомление: Файл не содержит текста (возможно, это графический скан без текстового слоя OCR)]"
+            
+        if len(text) > MAX_TEXT_LENGTH:
+            # Усечение текста для предотвращения переполнения токенов
+            text = text[:MAX_TEXT_LENGTH] + "\n\n[Системное уведомление: Документ превышает допустимый размер. Текст был усечен для анализа.]"
+            
+        return text
     except Exception as e:
+        print(f"[FILE_PARSER] Ошибка при десериализации {filename}: {e}")
+        return "[Системное уведомление: Произошла техническая ошибка при чтении структуры файла]"
 
-        raise ParseError(
-            f"PDF: {e}"
-        )
+def _parse_pdf(file_path: str) -> str:
+    text_blocks = []
+    with open(file_path, "rb") as f:
+        reader = PdfReader(f)
+        for page in reader.pages:
+            extracted = page.extract_text()
+            if extracted:
+                text_blocks.append(extracted)
+    return "\n".join(text_blocks)
 
+def _parse_docx(file_path: str) -> str:
+    doc = Document(file_path)
+    return "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
 
-def parse_docx(file_path: str) -> str:
+def _parse_xlsx(file_path: str) -> str:
+    # Использование read_only=True минимизирует потребление RAM для больших таблиц
+    wb = load_workbook(filename=file_path, data_only=True, read_only=True)
+    text_blocks = []
+    for sheet in wb.worksheets:
+        text_blocks.append(f"--- Таблица/Лист: {sheet.title} ---")
+        for row in sheet.iter_rows(values_only=True):
+            row_data = [str(cell) for cell in row if cell is not None]
+            if row_data:
+                text_blocks.append(" | ".join(row_data))
+    return "\n".join(text_blocks)
 
+def _parse_csv(file_path: str) -> str:
+    # Эвристическое определение кодировки файла по первым байтам
+    with open(file_path, 'rb') as f:
+        raw_data = f.read(10000)
+        detected = chardet.detect(raw_data)
+        encoding = detected['encoding'] or 'utf-8'
+        
+    text_blocks = []
+    with open(file_path, 'r', encoding=encoding, errors='replace') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            text_blocks.append(" | ".join(row))
+    return "\n".join(text_blocks)
+
+def _parse_pptx(file_path: str) -> str:
+    prs = Presentation(file_path)
+    text_blocks = []
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text.strip():
+                text_blocks.append(shape.text.strip())
+    return "\n".join(text_blocks)
+
+def _parse_txt(file_path: str) -> str:
+    with open(file_path, 'rb') as f:
+        raw_data = f.read()
+        detected = chardet.detect(raw_data)
+        encoding = detected['encoding'] or 'utf-8'
+    return raw_data.decode(encoding, errors='replace')import os
+import csv
+import chardet
+from io import BytesIO
+from PyPDF2 import PdfReader
+from docx import Document
+from openpyxl import load_workbook
+from pptx import Presentation
+
+MAX_TEXT_LENGTH = 20000  # Жесткое ограничение для защиты контекстного окна LLM
+
+def parse_file(file_path: str, filename: str) -> str:
+    """
+    Фасадная функция для извлечения текста из различных форматов.
+    Обеспечивает перехват исключений и предотвращает падение основного процесса.
+    """
+    ext = os.path.splitext(filename)[1].lower()
+    text = ""
+    
     try:
-
-        document = docx.Document(file_path)
-
-        parts = []
-
-        # Обычный текст.
-        for paragraph in document.paragraphs:
-
-            text = paragraph.text.strip()
-
-            if text:
-                parts.append(text)
-
-        # Таблицы.
-        for table in document.tables:
-
-            for row in table.rows:
-
-                cells = [
-                    cell.text.strip()
-                    for cell in row.cells
-                ]
-
-                parts.append(
-                    " | ".join(cells)
-                )
-
-        return "\n".join(parts).strip()
-
+        if ext == '.pdf':
+            text = _parse_pdf(file_path)
+        elif ext in ['.docx', '.doc']:
+            text = _parse_docx(file_path)
+        elif ext == '.xlsx':
+            text = _parse_xlsx(file_path)
+        elif ext == '.csv':
+            text = _parse_csv(file_path)
+        elif ext == '.pptx':
+            text = _parse_pptx(file_path)
+        elif ext == '.txt':
+            text = _parse_txt(file_path)
+        else:
+            return f"[Системное уведомление: Формат {ext} не поддерживается для прямого извлечения текста]"
+            
+        if not text or not text.strip():
+            return "[Системное уведомление: Файл не содержит текста (возможно, это графический скан без текстового слоя OCR)]"
+            
+        if len(text) > MAX_TEXT_LENGTH:
+            # Усечение текста для предотвращения переполнения токенов
+            text = text[:MAX_TEXT_LENGTH] + "\n\n[Системное уведомление: Документ превышает допустимый размер. Текст был усечен для анализа.]"
+            
+        return text
     except Exception as e:
-
-        raise ParseError(
-            f"DOCX: {e}"
-        )
-
-
-def parse_pptx(file_path: str) -> str:
-
-    try:
-
-        presentation = Presentation(file_path)
-
-        slides = []
-
-        for slide_number, slide in enumerate(
-            presentation.slides,
-            start=1
-        ):
-
-            parts = [
-                f"[Слайд {slide_number}]"
-            ]
-
-            for shape in slide.shapes:
-
-                if hasattr(shape, "text"):
-
-                    text = shape.text.strip()
-
-                    if text:
-                        parts.append(text)
-
-            slides.append(
-                "\n".join(parts)
-            )
-
-        return "\n\n".join(slides).strip()
-
-    except Exception as e:
-
-        raise ParseError(
-            f"PPTX: {e}"
-        )
-
-
-def parse_xlsx(file_path: str) -> str:
-
-    try:
-
-        workbook = openpyxl.load_workbook(
-            file_path,
-            data_only=True,
-            read_only=True
-        )
-
-        sheets = []
-
-        for sheet in workbook.worksheets:
-
-            rows = [
-                f"[Лист: {sheet.title}]"
-            ]
-
-            for row in sheet.iter_rows(
-                values_only=True
-            ):
-
-                values = []
-
-                for value in row:
-
-                    if value is None:
-                        values.append("")
-                    else:
-                        values.append(str(value))
-
-                line = " | ".join(values).strip()
-
-                if line:
-                    rows.append(line)
-
-            sheets.append(
-                "\n".join(rows)
-            )
-
-        workbook.close()
-
-        return "\n\n".join(sheets).strip()
-
-    except Exception as e:
-
-        raise ParseError(
-            f"XLSX: {e}"
-        )
-
-
-def detect_encoding(file_path: str) -> str:
-
-    try:
-
-        with open(
-            file_path,
-            "rb"
-        ) as f:
-
-            raw = f.read(100000)
-
-        result = chardet.detect(raw)
-
-        encoding = result.get("encoding")
-
-        if encoding:
-            return encoding
-
-    except Exception:
-        pass
-
-    return "utf-8"
-
-
-def parse_text(file_path: str) -> str:
-
-    try:
-
-        encoding = detect_encoding(
-            file_path
-        )
-
-        with open(
-            file_path,
-            "r",
-            encoding=encoding,
-            errors="replace"
-        ) as f:
-
-            return f.read().strip()
-
-    except Exception as e:
-
-        raise ParseError(
-            f"TXT/CSV: {e}"
-        )
-
-
-def parse_csv(file_path: str) -> str:
-
-    try:
-
-        encoding = detect_encoding(
-            file_path
-        )
-
-        rows = []
-
-        with open(
-            file_path,
-            "r",
-            encoding=encoding,
-            errors="replace",
-            newline=""
-        ) as f:
-
-            reader = csv.reader(f)
-
-            for row in reader:
-
-                rows.append(
-                    " | ".join(row)
-                )
-
-        return "\n".join(rows).strip()
-
-    except Exception as e:
-
-        raise ParseError(
-            f"CSV: {e}"
-        )
-
-
-def parse_file(file_path: str, original_name: str = "") -> str:
-
-    extension = (
-        os.path.splitext(
-            original_name or file_path
-        )[1]
-        .lower()
-    )
-
-    if not extension:
-
-        extension = (
-            os.path.splitext(file_path)[1]
-            .lower()
-        )
-
-    if extension == ".pdf":
-        return parse_pdf(file_path)
-
-    if extension == ".docx":
-        return parse_docx(file_path)
-
-    if extension == ".pptx":
-        return parse_pptx(file_path)
-
-    if extension in (
-        ".xlsx",
-        ".xlsm"
-    ):
-        return parse_xlsx(file_path)
-
-    if extension == ".csv":
-        return parse_csv(file_path)
-
-    if extension in (
-        ".txt",
-        ".md",
-        ".py",
-        ".json",
-        ".xml",
-        ".html",
-        ".css",
-        ".js",
-        ".log"
-    ):
-        return parse_text(file_path)
-
-    raise ParseError(
-        f"Неподдерживаемый тип файла: {extension}"
-    )
+        print(f"[FILE_PARSER] Ошибка при десериализации {filename}: {e}")
+        return "[Системное уведомление: Произошла техническая ошибка при чтении структуры файла]"
+
+def _parse_pdf(file_path: str) -> str:
+    text_blocks = []
+    with open(file_path, "rb") as f:
+        reader = PdfReader(f)
+        for page in reader.pages:
+            extracted = page.extract_text()
+            if extracted:
+                text_blocks.append(extracted)
+    return "\n".join(text_blocks)
+
+def _parse_docx(file_path: str) -> str:
+    doc = Document(file_path)
+    return "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+
+def _parse_xlsx(file_path: str) -> str:
+    # Использование read_only=True минимизирует потребление RAM для больших таблиц
+    wb = load_workbook(filename=file_path, data_only=True, read_only=True)
+    text_blocks = []
+    for sheet in wb.worksheets:
+        text_blocks.append(f"--- Таблица/Лист: {sheet.title} ---")
+        for row in sheet.iter_rows(values_only=True):
+            row_data = [str(cell) for cell in row if cell is not None]
+            if row_data:
+                text_blocks.append(" | ".join(row_data))
+    return "\n".join(text_blocks)
+
+def _parse_csv(file_path: str) -> str:
+    # Эвристическое определение кодировки файла по первым байтам
+    with open(file_path, 'rb') as f:
+        raw_data = f.read(10000)
+        detected = chardet.detect(raw_data)
+        encoding = detected['encoding'] or 'utf-8'
+        
+    text_blocks = []
+    with open(file_path, 'r', encoding=encoding, errors='replace') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            text_blocks.append(" | ".join(row))
+    return "\n".join(text_blocks)
+
+def _parse_pptx(file_path: str) -> str:
+    prs = Presentation(file_path)
+    text_blocks = []
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text.strip():
+                text_blocks.append(shape.text.strip())
+    return "\n".join(text_blocks)
+
+def _parse_txt(file_path: str) -> str:
+    with open(file_path, 'rb') as f:
+        raw_data = f.read()
+        detected = chardet.detect(raw_data)
+        encoding = detected['encoding'] or 'utf-8'
+    return raw_data.decode(encoding, errors='replace')
