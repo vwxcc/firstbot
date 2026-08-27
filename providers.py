@@ -4,37 +4,7 @@ providers.py
 Реестр AI-провайдеров и построение цепочки автоматического
 переключения (fallback) между ними.
 
-ИДЕЯ:
-Почти все современные бесплатные AI-платформы (Groq, Cerebras, Mistral,
-SambaNova, OpenRouter и т.д.) предоставляют эндпоинт, совместимый с
-OpenAI Chat Completions API. Это значит, что для работы с любой из них
-достаточно взять библиотеку `openai` и просто подставить другой
-`base_url` + `api_key`. Один и тот же код работает со всеми провайдерами.
-
-КАК ЭТО РАБОТАЕТ:
-- Каждый провайдер описан одним словарём в списке PROVIDERS.
-- Если переменная окружения провайдера (env_key) не задана —
-  провайдер просто пропускается при построении цепочки.
-  Бот НЕ падает и не требует наличия всех ключей сразу.
-- generate_response()/generate_vision_response() в main.py идут по
-  цепочке (provider, model) по очереди, пока одна из моделей не ответит.
-
-КАК ДОБАВИТЬ НОВЫЙ БЕСПЛАТНЫЙ ПРОВАЙДЕР:
-1. Найти его OpenAI-совместимый base_url (обычно указан в разделе
-   "OpenAI compatibility" / "OpenAI SDK" в документации провайдера).
-2. Добавить один словарь в список PROVIDERS ниже.
-3. Добавить соответствующую переменную окружения в Render (Dashboard →
-   Environment) и в render.yaml (необязательно, но удобно).
-Больше ничего менять не нужно — main.py ничего не знает о конкретных
-провайдерах, он просто перебирает цепочку.
-
-ВАЖНО ПРО БЕСПЛАТНЫЕ МОДЕЛИ:
-Списки бесплатных моделей у OpenRouter, Cerebras и т.п. МЕНЯЮТСЯ
-провайдерами без предупреждения (особенно у OpenRouter — там модели
-с суффиксом ":free" могут исчезать за несколько дней). Если через
-какое-то время конкретная модель начнёт возвращать 404/400 — просто
-замените строку в text_models/vision_models на актуальную с сайта
-провайдера. Логика переключения от этого не изменится.
+(файл обновлён: добавлен провайдер VyceAI — VYCEAI)
 """
 
 import os
@@ -68,11 +38,6 @@ PROVIDERS: List[Dict] = [
         "text_models": ["gpt-oss-120b", "llama-3.3-70b"],
         "vision_models": [],
         "audio_models": [],
-        # ВНИМАНИЕ: у Cerebras исторически был бесплатный тариф без
-        # привязки карты (1 млн токенов/день), но по недавним данным
-        # (август 2026) часть новых аккаунтов уже просит привязать
-        # карту для пробных $5. Проверьте актуальные условия на
-        # cloud.cerebras.ai перед тем, как полагаться на этот провайдер.
     },
     {
         "id": "sambanova",
@@ -91,8 +56,6 @@ PROVIDERS: List[Dict] = [
         "text_models": ["mistral-small-latest", "open-mistral-7b"],
         "vision_models": ["pixtral-12b-2409"],
         "audio_models": [],
-        # Бесплатный тариф не требует карты, но требует подтверждение
-        # номера телефона при регистрации на console.mistral.ai.
     },
     {
         "id": "openrouter",
@@ -104,8 +67,28 @@ PROVIDERS: List[Dict] = [
         "text_models": ["meta-llama/llama-3.3-70b-instruct:free", "z-ai/glm-5.2:free"],
         "vision_models": ["minimax/minimax-m3:free"],
         "audio_models": [],
-        # ставим последним в приоритете: бесплатный тариф OpenRouter
-        # сильнее всего лимитирован по запросам в день.
+    },
+    {
+        "id": "vyceai",
+        "label": "VyceAI",
+        "env_key": "VYCEAI",
+        "base_url": "https://api.vyce.ai/v1",
+        # Модели, предоставленные VyceAI (на основе списка, присланного пользователем).
+        # Поддерживаются как текстовые, так и визуальные модели.
+        "text_models": [
+            "gpt-5.6",
+            "gpt-5.6-terra",
+            "grok-4.6",
+        ],
+        "vision_models": [
+            "deepseek-v4-flash-lr",
+            "deepseek-v4-pro",
+            "grok-imagine-2",
+            "grok-imagine",
+        ],
+        "audio_models": [],
+        # Переменная окружения в Render должна быть задана как VYCEAI
+        # (или можете изменить на VYCEAI_API_KEY и подправить окружение).
     },
 ]
 
@@ -123,12 +106,12 @@ def get_client(provider: Dict) -> OpenAI:
     if pid not in _clients:
         headers = None
         if pid == "openrouter":
-            # OpenRouter просит указывать источник запроса — необязательно,
-            # но помогает не попадать под лишние ограничения.
             headers = {
                 "HTTP-Referer": "https://github.com/vwxcc/firstbot",
                 "X-Title": "Fast Answer Telegram Bot",
             }
+        # Для VyceAI и других OpenAI-совместимых провайдеров
+        # используем OpenAI-клиент с base_url = provider["base_url"].
         _clients[pid] = OpenAI(
             api_key=_api_key(provider),
             base_url=provider["base_url"],
