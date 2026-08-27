@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import re
 import traceback
 from pathlib import Path
@@ -10,58 +9,60 @@ import telebot
 
 
 # ============================================================
-# НАСТРОЙКИ
+# CONFIG
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CVC_API_KEY = os.getenv("CVC_API_KEY")
 
-# Gateway из инструкции OpenCode
+# OpenAI-compatible API сайта
 BASE_URL = "https://ai.starimg.ru/v1"
 
-# Переменная с IP/адресом, если она нужна
-# для твоей инфраструктуры.
-CLAUDE2MLN1 = os.getenv("CLAUDE2MLN1")
-
-# Основная модель.
+# Основная модель
 MODEL = os.getenv(
     "MODEL",
     "cheapvibecode/claude-sonnet-4-6"
 )
 
-# Модель для сжатия истории.
+# Модель для сжатия истории
 SUMMARY_MODEL = os.getenv(
     "SUMMARY_MODEL",
     "cheapvibecode/claude-haiku-4-5"
 )
 
-# После какого количества сообщений
-# запускать сжатие.
+# После такого количества сообщений пользователя
+# запускается сжатие истории.
 COMPRESS_EVERY = 12
 
-# Сколько последних сообщений оставить
-# после сжатия.
+# После сжатия сохраняем последние сообщения.
 KEEP_LAST_MESSAGES = 8
 
-# Сколько символов максимум отправлять
-# Telegram одним сообщением.
+# Лимит Telegram
 TELEGRAM_LIMIT = 4000
 
+# Таймаут запроса к AI
 REQUEST_TIMEOUT = 180
 
 
 # ============================================================
-# ПРОВЕРКА ENV
+# CHECK ENV
 # ============================================================
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "Не задан BOT_TOKEN"
+        "Не задана переменная BOT_TOKEN"
     )
 
 if not CVC_API_KEY:
     raise RuntimeError(
-        "Не задан CVC_API_KEY"
+        "Не задана переменная CVC_API_KEY"
+    )
+
+if not CVC_API_KEY.startswith("sk-"):
+    print(
+        "[WARNING] CVC_API_KEY обычно должен "
+        "начинаться с sk-",
+        flush=True
     )
 
 
@@ -76,7 +77,7 @@ bot = telebot.TeleBot(
 
 
 # ============================================================
-# ХРАНЕНИЕ ИСТОРИИ
+# HISTORY
 # ============================================================
 
 DATA_DIR = Path("data")
@@ -91,23 +92,18 @@ histories = {}
 
 
 def load_histories():
-
     global histories
 
     if not HISTORY_FILE.exists():
-
         histories = {}
-
         return
 
     try:
-
         with open(
             HISTORY_FILE,
             "r",
             encoding="utf-8"
         ) as f:
-
             histories = json.load(f)
 
         print(
@@ -117,7 +113,6 @@ def load_histories():
         )
 
     except Exception as e:
-
         print(
             "[HISTORY] Ошибка загрузки:",
             repr(e),
@@ -128,19 +123,16 @@ def load_histories():
 
 
 def save_histories():
-
     temp_file = HISTORY_FILE.with_suffix(
         ".tmp"
     )
 
     try:
-
         with open(
             temp_file,
             "w",
             encoding="utf-8"
         ) as f:
-
             json.dump(
                 histories,
                 f,
@@ -153,7 +145,6 @@ def save_histories():
         )
 
     except Exception as e:
-
         print(
             "[HISTORY] Ошибка сохранения:",
             repr(e),
@@ -162,11 +153,9 @@ def save_histories():
 
 
 def get_history(chat_id):
-
     chat_id = str(chat_id)
 
     if chat_id not in histories:
-
         histories[chat_id] = {
             "summary": "",
             "messages": [],
@@ -181,44 +170,38 @@ def add_message(
     role,
     content
 ):
-
     history = get_history(chat_id)
 
-    history["messages"].append(
-        {
-            "role": role,
-            "content": content
-        }
-    )
+    history["messages"].append({
+        "role": role,
+        "content": content
+    })
 
     if role == "user":
-
-        history[
-            "user_message_count"
-        ] += 1
+        history["user_message_count"] += 1
 
     save_histories()
 
 
 # ============================================================
-# ОЧИСТКА ОТ ЛИШНИХ ЗВЁЗДОЧЕК
+# CLEAN ANSWER
 # ============================================================
 
 def clean_answer(text):
-
     if not text:
         return ""
 
-    text = text.strip()
+    text = str(text).strip()
 
-    # Убираем Markdown-заголовки
+    # Убираем Markdown-заголовки:
+    # ### Заголовок -> Заголовок
     text = re.sub(
         r"(?m)^\s*#{1,6}\s+",
         "",
         text
     )
 
-    # Убираем декоративные строки
+    # Убираем строки из одних звездочек
     text = re.sub(
         r"(?m)^\s*\*{2,}\s*$",
         "",
@@ -241,14 +224,22 @@ def clean_answer(text):
         flags=re.DOTALL
     )
 
-    # Не оставляем одиночные декоративные *
+    # __текст__ -> текст
+    text = re.sub(
+        r"__(.*?)__",
+        r"\1",
+        text,
+        flags=re.DOTALL
+    )
+
+    # Убираем отдельные декоративные *
     text = re.sub(
         r"(?m)^\s*\*\s*$",
         "",
         text
     )
 
-    # Тройные и более переносы
+    # Не допускаем огромное количество пустых строк
     text = re.sub(
         r"\n{3,}",
         "\n\n",
@@ -259,29 +250,23 @@ def clean_answer(text):
 
 
 # ============================================================
-# ЗАПРОС К GATEWAY
+# AI REQUEST
 # ============================================================
 
-def claude_request(
+def ai_request(
     messages,
     model,
     temperature=0.5
 ):
-
     url = (
         BASE_URL.rstrip("/")
         + "/chat/completions"
     )
 
     headers = {
-        "Authorization":
-            f"Bearer {CVC_API_KEY}",
-
-        "Content-Type":
-            "application/json",
-
-        "Accept":
-            "application/json"
+        "Authorization": f"Bearer {CVC_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
     }
 
     payload = {
@@ -291,12 +276,11 @@ def claude_request(
     }
 
     print(
-        f"[AI] Запрос модели: {model}",
+        f"[AI] Модель: {model}",
         flush=True
     )
 
     try:
-
         response = requests.post(
             url,
             headers=headers,
@@ -305,10 +289,10 @@ def claude_request(
         )
 
     except requests.RequestException as e:
-
         print(
-            f"[AI] HTTP ERROR "
-            f"{model}: {repr(e)}",
+            f"[AI ERROR] Ошибка соединения "
+            f"с моделью {model}:",
+            repr(e),
             flush=True
         )
 
@@ -323,37 +307,35 @@ def claude_request(
     if response.status_code >= 400:
 
         print(
-            f"[AI] MODEL ERROR: {model}",
+            f"[MODEL ERROR] {model}",
             flush=True
         )
 
         print(
-            response.text[:3000],
+            response.text[:5000],
             flush=True
         )
 
         raise RuntimeError(
+            f"Модель {model} вернула "
             f"HTTP {response.status_code}"
         )
 
     try:
-
         data = response.json()
 
     except Exception:
-
         print(
-            "[AI] Gateway вернул не JSON:",
-            response.text[:3000],
+            "[AI ERROR] API вернул не JSON:",
+            response.text[:5000],
             flush=True
         )
 
         raise RuntimeError(
-            "Некорректный ответ gateway"
+            "API вернул некорректный ответ"
         )
 
     try:
-
         content = (
             data["choices"][0]
             ["message"]
@@ -361,20 +343,27 @@ def claude_request(
         )
 
     except Exception:
+        print(
+            "[AI ERROR] Не удалось найти "
+            "choices[0].message.content",
+            flush=True
+        )
 
         print(
-            "[AI] Неизвестный формат ответа:",
             json.dumps(
                 data,
-                ensure_ascii=False
+                ensure_ascii=False,
+                indent=2
             )[:5000],
             flush=True
         )
 
         raise RuntimeError(
-            "Не найден content в ответе"
+            "Неизвестный формат ответа API"
         )
 
+    # Некоторые API могут вернуть список
+    # частей вместо обычной строки.
     if isinstance(content, list):
 
         parts = []
@@ -398,31 +387,33 @@ def claude_request(
 
 
 # ============================================================
-# СИСТЕМНЫЙ ПРОМПТ
+# SYSTEM PROMPT
 # ============================================================
 
 SYSTEM_PROMPT = """
 Ты AI-ассистент Telegram-бота.
 
-Отвечай преимущественно на русском языке.
+Отвечай на русском языке, если пользователь
+не попросил другой язык.
 
-Отвечай непосредственно на вопрос пользователя.
+Отвечай непосредственно на вопрос.
 
-Не используй лишнее форматирование Markdown.
+Не используй лишнее форматирование.
 
-Не ставь вокруг обычного текста много звёздочек.
+Не окружай обычные предложения большим
+количеством звёздочек.
 
 Не добавляй ненужные вступления.
 
-Если пользователь явно попросил другой язык,
-отвечай на этом языке.
+Используй контекст предыдущего разговора.
 
-Учитывай предыдущий контекст разговора.
+Если информации недостаточно, честно скажи об этом.
+Не выдумывай факты.
 """.strip()
 
 
 # ============================================================
-# ФОРМИРОВАНИЕ КОНТЕКСТА
+# BUILD CONTEXT
 # ============================================================
 
 def build_messages(chat_id):
@@ -443,15 +434,13 @@ def build_messages(chat_id):
 
     if summary:
 
-        messages.append(
-            {
-                "role": "system",
-                "content":
-                    "Память предыдущего "
-                    "диалога:\n\n"
-                    + summary
-            }
-        )
+        messages.append({
+            "role": "system",
+            "content":
+                "Краткая память предыдущей "
+                "части разговора:\n\n"
+                + summary
+        })
 
     messages.extend(
         history.get(
@@ -464,7 +453,7 @@ def build_messages(chat_id):
 
 
 # ============================================================
-# СЖАТИЕ ИСТОРИИ
+# COMPRESS HISTORY
 # ============================================================
 
 def compress_chat(chat_id):
@@ -477,7 +466,6 @@ def compress_chat(chat_id):
     )
 
     if len(messages) <= KEEP_LAST_MESSAGES:
-
         return
 
     old_messages = messages[
@@ -492,18 +480,13 @@ def compress_chat(chat_id):
 
     for message in old_messages:
 
-        role = message["role"]
-
-        if role == "user":
-
-            name = "Пользователь"
-
+        if message["role"] == "user":
+            role = "Пользователь"
         else:
-
-            name = "Ассистент"
+            role = "Ассистент"
 
         old_parts.append(
-            f"{name}: "
+            f"{role}: "
             f"{message['content']}"
         )
 
@@ -517,56 +500,54 @@ def compress_chat(chat_id):
     )
 
     prompt = f"""
-Создай компактную память предыдущего диалога.
+Сделай компактное и точное резюме
+предыдущей части разговора.
 
-Сохрани только информацию, которая действительно
-может понадобиться в следующих сообщениях.
+Предыдущее резюме:
+{previous_summary}
 
-Обязательно сохрани:
+Предыдущая часть диалога:
+{old_text}
+
+Сохрани только действительно важную
+информацию, которая может понадобиться
+для продолжения разговора:
 
 - цели пользователя;
 - важные факты;
-- важные числа;
+- числа;
 - названия;
-- решения;
-- предпочтения, если они важны;
+- принятые решения;
 - текущие задачи;
 - незавершённые задачи;
-- важный технический контекст.
+- технический контекст;
+- важные предпочтения.
 
-Не пересказывай каждую реплику.
+Не выдумывай информацию.
 
-Не добавляй информацию,
-которой не было в разговоре.
+Не пересказывай каждое сообщение.
 
-Предыдущее резюме:
-
-{previous_summary}
-
-Старая часть диалога:
-
-{old_text}
-
-Верни только новое компактное резюме
+Верни только компактную память
 на русском языке.
 """.strip()
 
     print(
-        f"[HISTORY] Начинаю сжатие "
+        f"[HISTORY] Сжимаю историю "
         f"чата {chat_id}",
         flush=True
     )
 
     try:
 
-        summary = claude_request(
+        summary = ai_request(
             [
                 {
                     "role": "system",
                     "content":
-                        "Ты модуль памяти AI-ассистента. "
-                        "Создавай только краткие "
-                        "и точные резюме."
+                        "Ты модуль памяти "
+                        "AI-ассистента. "
+                        "Создавай только точные "
+                        "и компактные резюме."
                 },
                 {
                     "role": "user",
@@ -582,13 +563,12 @@ def compress_chat(chat_id):
         )
 
         if not summary:
-
             raise RuntimeError(
-                "Пустое резюме"
+                "Модель вернула пустое резюме"
             )
 
-        # Только после успешного
-        # получения summary меняем историю.
+        # Удаляем старую часть только
+        # после успешного сжатия.
 
         history["summary"] = summary
 
@@ -599,28 +579,27 @@ def compress_chat(chat_id):
         save_histories()
 
         print(
-            f"[HISTORY] Чат {chat_id} "
-            f"успешно сжат",
+            f"[HISTORY] История чата "
+            f"{chat_id} сжата успешно",
             flush=True
         )
 
     except Exception as e:
 
         print(
-            f"[HISTORY] Ошибка сжатия "
-            f"чата {chat_id}:",
+            f"[HISTORY ERROR] Чат "
+            f"{chat_id}:",
             repr(e),
             flush=True
         )
 
         traceback.print_exc()
 
-        # Старые сообщения НЕ удаляем,
-        # если сжатие не удалось.
+        # При ошибке ничего не удаляем.
 
 
 # ============================================================
-# AI ОТВЕТ
+# GENERATE RESPONSE
 # ============================================================
 
 def generate_response(
@@ -643,14 +622,11 @@ def generate_response(
         0
     )
 
-    # Сжимаем каждые N сообщений.
-
+    # Каждые 12 сообщений
     if (
         count > 0
-        and
-        count % COMPRESS_EVERY == 0
+        and count % COMPRESS_EVERY == 0
     ):
-
         compress_chat(
             chat_id
         )
@@ -659,7 +635,7 @@ def generate_response(
         chat_id
     )
 
-    answer = claude_request(
+    answer = ai_request(
         messages,
         model=MODEL,
         temperature=0.5
@@ -668,6 +644,11 @@ def generate_response(
     answer = clean_answer(
         answer
     )
+
+    if not answer:
+        raise RuntimeError(
+            "Модель вернула пустой ответ"
+        )
 
     add_message(
         chat_id,
@@ -679,7 +660,7 @@ def generate_response(
 
 
 # ============================================================
-# ДЛИННЫЕ ОТВЕТЫ TELEGRAM
+# SEND LONG MESSAGE
 # ============================================================
 
 def send_long_message(
@@ -691,8 +672,7 @@ def send_long_message(
     text = text.strip()
 
     if not text:
-
-        text = "Не удалось получить ответ."
+        text = "Модель не вернула ответ."
 
     first = True
 
@@ -709,7 +689,6 @@ def send_long_message(
             )
 
             if split_pos > 1000:
-
                 part = part[
                     :split_pos
                 ]
@@ -736,7 +715,7 @@ def send_long_message(
 
 
 # ============================================================
-# START
+# /START
 # ============================================================
 
 @bot.message_handler(
@@ -751,7 +730,7 @@ def start_handler(message):
 
 
 # ============================================================
-# CLEAR
+# /CLEAR
 # ============================================================
 
 @bot.message_handler(
@@ -792,7 +771,7 @@ def text_handler(message):
 
     print(
         f"[TEXT] chat={chat_id}: "
-        f"{message.text[:200]}",
+        f"{message.text[:300]}",
         flush=True
     )
 
@@ -817,7 +796,7 @@ def text_handler(message):
     except Exception as e:
 
         print(
-            "[TEXT] ERROR:",
+            "[TEXT ERROR]",
             repr(e),
             flush=True
         )
@@ -826,13 +805,13 @@ def text_handler(message):
 
         bot.send_message(
             chat_id,
-            "Модель временно не ответила. "
-            "Попробуй ещё раз немного позже."
+            "Не получилось получить ответ "
+            "от модели. Попробуй ещё раз немного позже."
         )
 
 
 # ============================================================
-# TELEGRAM START
+# MAIN
 # ============================================================
 
 def main():
@@ -843,17 +822,17 @@ def main():
     )
 
     print(
-        "🚀 Fast Answer / Claude Gateway",
+        "🚀 Fast Answer",
         flush=True
     )
 
     print(
-        f"🌐 Base URL: {BASE_URL}",
+        "🌐 API: https://ai.starimg.ru/v1",
         flush=True
     )
 
     print(
-        f"🤖 Model: {MODEL}",
+        f"🤖 Main model: {MODEL}",
         flush=True
     )
 
@@ -863,24 +842,18 @@ def main():
     )
 
     print(
-        f"📦 Сжатие каждые "
-        f"{COMPRESS_EVERY} сообщений",
+        f"📦 Compression: every "
+        f"{COMPRESS_EVERY} user messages",
         flush=True
     )
 
-    if CLAUDE2MLN1:
+    print(
+        "🔑 CVC_API_KEY: задан",
+        flush=True
+    )
 
-        print(
-            "🌐 CLAUDE2MLN1: задан",
-            flush=True
-        )
-
-    else:
-
-        print(
-            "ℹ️ CLAUDE2MLN1: не задан",
-            flush=True
-        )
+    # ВАЖНО:
+    # CLAUDE2MLN1 здесь вообще не используется.
 
     print(
         "==========================================",
@@ -889,14 +862,15 @@ def main():
 
     load_histories()
 
-    # Проверяем Telegram.
+    # Проверяем Telegram
 
     try:
 
         me = bot.get_me()
 
         print(
-            f"✅ Telegram: @{me.username}",
+            f"✅ Telegram подключён: "
+            f"@{me.username}",
             flush=True
         )
 
@@ -910,7 +884,8 @@ def main():
 
         raise
 
-    # Удаляем webhook.
+    # Убираем webhook,
+    # чтобы Long Polling работал корректно.
 
     try:
 
@@ -919,14 +894,14 @@ def main():
         )
 
         print(
-            "✅ Webhook удалён",
+            "✅ Webhook отключён",
             flush=True
         )
 
     except Exception as e:
 
         print(
-            "⚠️ Webhook:",
+            "⚠️ Не удалось отключить webhook:",
             repr(e),
             flush=True
         )
@@ -944,5 +919,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
