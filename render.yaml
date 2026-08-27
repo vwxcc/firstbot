@@ -1,7 +1,17 @@
 services:
   - type: worker
     name: fast-answer-bot
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
-    autoDeploy: true
+    env: python
+    buildCommand: "apt-get update -qq && apt-get install -y -qq ffmpeg && pip install -r requirements.txt"
+    startCommand: "python main.py"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: BOT_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+    disk:
+      name: bot-history-data
+      mountPath: /data
+      sizeGB: 1
