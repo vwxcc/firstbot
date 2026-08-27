@@ -9,7 +9,6 @@ from typing import List, Dict, Optional
 
 import telebot
 from telebot.apihelper import ApiTelegramException
-from groq import Groq
 import httpx
 
 # Поддержка формата HEIC (iPhone)
@@ -18,19 +17,23 @@ from pillow_heif import register_heif_opener
 register_heif_opener()
 
 from file_parser import parse_file
+from providers import PROVIDERS, build_chain, get_client, describe_missing
 
 # ==========================================
 # 1. КОНФИГУРАЦИЯ И СИСТЕМНЫЕ ЗАВИСИМОСТИ
 # ==========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-if not BOT_TOKEN or not GROQ_API_KEY:
-    print("[КРИТИЧЕСКАЯ ОШИБКА] BOT_TOKEN или GROQ_API_KEY отсутствуют. Остановка.")
+if not BOT_TOKEN:
+    print("[КРИТИЧЕСКАЯ ОШИБКА] BOT_TOKEN отсутствует в переменных окружения. Остановка.")
     exit(1)
 
 bot = telebot.TeleBot(BOT_TOKEN)
-groq_client = Groq(api_key=GROQ_API_KEY)
+
+# Цепочки AI-провайдеров заполняются в main() при старте — тогда уже
+# понятно, какие переменные окружения реально заданы на Render.
+TEXT_CHAIN: List[tuple] = []
+VISION_CHAIN: List[tuple] = []
 
 # Хранилище контекста диалогов
 HISTORY_FILE = os.getenv("HISTORY_FILE_PATH", "/data/history.json")
@@ -40,24 +43,10 @@ if not os.path.exists(os.path.dirname(HISTORY_FILE)) and os.path.dirname(HISTORY
 COMPRESSION_EVERY = 12
 MAX_CHARS_BEFORE_COMPRESSION = 2000
 
-# ОБНОВЛЕННЫЕ МОДЕЛИ 2026 ГОДА
-TEXT_MODELS = [
-    "openai/gpt-oss-120b",  # Флагманская модель, 131k контекст, 500 t/s
-    "openai/gpt-oss-20b"    # Резервная модель, 1000 t/s
-]
-
-VISION_MODELS = [
-    "llama-3.2-90b-vision-preview" 
-]
-
-AUDIO_MODELS = [
-    "whisper-large-v3-turbo",
-    "whisper-large-v3"
-]
-
 SYSTEM_PROMPT = """Ты — полезный, дружелюбный AI-ассистент.
 ПРАВИЛА:
-1. Отвечай ИСКЛЮЧИТЕЛЬНО на русском языке.
+1. Отвечай ИСКЛЮЧИТЕЛЬНО на русском языке, даже если пользователь пишет на другом языке
+   (если он явно не попросил отвечать на другом языке).
 2. Будь кратким, понятным и вежливым. Избегай сухого технического стиля.
 3. Отвечай прямо на вопрос.
 4. Учитывай контекст предыдущего диалога.
@@ -92,134 +81,176 @@ def add_message(chat_id: int, role: str, content: str):
     chat_id_str = str(chat_id)
     if chat_id_str not in conversation_histories:
         conversation_histories[chat_id_str] = []
-    
+
     conversation_histories[chat_id_str].append({"role": role, "content": content})
-    
+
     user_msgs = sum(1 for m in conversation_histories[chat_id_str] if m['role'] == 'user')
     total_chars = sum(len(m['content']) for m in conversation_histories[chat_id_str])
-    
+
     if user_msgs >= COMPRESSION_EVERY or total_chars > MAX_CHARS_BEFORE_COMPRESSION:
         compress_history(chat_id_str)
     else:
         save_histories()
 
 def compress_history(chat_id: str):
-    """Динамическое сжатие контекста."""
+    """Динамическое сжатие контекста. Сначала считаем новый summary,
+    и только при успехе заменяем историю — при ошибке старая история
+    остаётся нетронутой."""
     history = conversation_histories[chat_id]
     to_compress = history[:-4]
     to_keep = history[-4:]
-    
+
     if not to_compress:
         return
 
     dialogue_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in to_compress])
-    
+
     prompt = (
         "Сделай максимально краткое резюме этого диалога (факты, имена, обсуждаемые вещи). Пиши на русском.\n\n"
         f"ДИАЛОГ:\n{dialogue_text}"
     )
 
-    try:
-        response = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model=TEXT_MODELS[0],
-            temperature=0.2,
-            max_tokens=700,
-        )
-        summary = response.choices[0].message.content
-        
-        new_history = [{"role": "assistant", "content": f"[Краткие воспоминания]: {summary}"}]
-        new_history.extend(to_keep)
-        
-        conversation_histories[chat_id] = new_history
+    summary = _run_text_chain([{"role": "user", "content": prompt}], temperature=0.2, max_tokens=700, timeout=30.0)
+
+    if summary is None:
+        print(f"[ПАМЯТЬ] Не удалось сжать историю chat_id={chat_id}: все модели недоступны. Оставляю историю как есть.")
         save_histories()
-    except Exception as e:
-        print(f"[ПАМЯТЬ] Ошибка сжатия: {e}")
+        return
+
+    new_history = [{"role": "assistant", "content": f"[Краткие воспоминания]: {summary}"}]
+    new_history.extend(to_keep)
+
+    conversation_histories[chat_id] = new_history
+    save_histories()
 
 # ==========================================
-# 3. МАРШРУТИЗАЦИЯ LLM (ФОЛЛБЕК)
+# 3. МАРШРУТИЗАЦИЯ AI (АВТОМАТИЧЕСКИЙ FALLBACK МЕЖДУ ПРОВАЙДЕРАМИ)
 # ==========================================
-def generate_response(chat_id: int) -> str:
-    chat_id_str = str(chat_id)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(conversation_histories.get(chat_id_str, []))
-
-    for model_name in TEXT_MODELS:
+def _run_text_chain(messages: list, temperature: float = 0.6, max_tokens: int = 2000,
+                     timeout: float = 25.0, notify_chat_id: Optional[int] = None) -> Optional[str]:
+    """Идёт по TEXT_CHAIN (provider, model) пока одна из моделей не ответит."""
+    warned = False
+    for provider, model in TEXT_CHAIN:
         try:
-            response = groq_client.chat.completions.create(
+            client = get_client(provider)
+            response = client.chat.completions.create(
+                model=model,
                 messages=messages,
-                model=model_name,
-                temperature=0.6,
-                max_tokens=2500,
-                timeout=25.0
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
             )
-            return clean_answer(response.choices[0].message.content)
+            print(f"[AI] Успешно: {provider['label']} / {model}")
+            return response.choices[0].message.content
         except Exception as e:
-            print(f"[ИИ] Ошибка {model_name}: {e}")
-            if model_name != TEXT_MODELS[-1]:
+            print(f"[AI] Ошибка модели {provider['label']} / {model}: {e}")
+            if notify_chat_id is not None and not warned:
+                warned = True
                 try:
-                    bot.send_message(chat_id, "Ой, задумался 😅 Пробую еще раз, секундочку... ⏳")
+                    bot.send_message(notify_chat_id, "Модель временно не ответила, пробую другую. Ещё немного... ⏳")
                 except Exception:
                     pass
-    
-    return "К сожалению, сейчас мои серверы перегружены 😔 Пожалуйста, попробуй написать чуть позже!"
+    print("[AI] Все текстовые провайдеры и модели исчерпаны")
+    return None
 
-def generate_vision_response(chat_id: int, prompt_text: str, base64_images: List[str]) -> str:
+def _run_vision_chain(prompt_text: str, base64_images: List[str],
+                       notify_chat_id: Optional[int] = None) -> Optional[str]:
+    """Идёт по VISION_CHAIN (provider, model) пока одна из vision-моделей не ответит."""
     content = [{"type": "text", "text": prompt_text}]
     for b64 in base64_images:
         content.append({
             "type": "image_url",
             "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
         })
-
     messages = [{"role": "user", "content": content}]
 
-    for model_name in VISION_MODELS:
+    warned = False
+    for provider, model in VISION_CHAIN:
         try:
-            response = groq_client.chat.completions.create(
+            client = get_client(provider)
+            response = client.chat.completions.create(
+                model=model,
                 messages=messages,
-                model=model_name,
                 temperature=0.4,
                 max_tokens=1500,
-                timeout=35.0
+                timeout=35.0,
             )
-            return clean_answer(response.choices[0].message.content)
+            print(f"[VISION] Успешно: {provider['label']} / {model}")
+            return response.choices[0].message.content
         except Exception as e:
-            print(f"[ЗРЕНИЕ] Ошибка {model_name}: {e}")
-            if model_name != VISION_MODELS[-1]:
+            print(f"[VISION] Ошибка модели {provider['label']} / {model}: {e}")
+            if notify_chat_id is not None and not warned:
+                warned = True
                 try:
-                    bot.send_message(chat_id, "Мои глазки немного устали 😵‍💫 Пробую посмотреть через резервную сеть... 👁️")
+                    bot.send_message(notify_chat_id, "Модель временно не ответила, пробую другую. Ещё немного... 👁️")
                 except Exception:
                     pass
-    
-    return "Прости, не могу разглядеть это изображение 😔 Возможно, файл поврежден."
+    print("[VISION] Все vision-провайдеры и модели исчерпаны")
+    return None
+
+def generate_response(chat_id: int) -> str:
+    chat_id_str = str(chat_id)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(conversation_histories.get(chat_id_str, []))
+
+    answer = _run_text_chain(messages, temperature=0.6, max_tokens=2500, timeout=25.0, notify_chat_id=chat_id)
+    if answer is None:
+        return "Сейчас не удалось получить ответ. Попробуй ещё раз немного позже."
+    return clean_answer(answer)
+
+def generate_vision_response(chat_id: int, prompt_text: str, base64_images: List[str]) -> str:
+    answer = _run_vision_chain(prompt_text, base64_images, notify_chat_id=chat_id)
+    if answer is None:
+        return "Прости, не могу разглядеть это изображение 😔 Сейчас все модели зрения недоступны — попробуй чуть позже."
+    return clean_answer(answer)
 
 def transcribe_audio(file_path: str) -> Optional[str]:
-    for model_name in AUDIO_MODELS:
+    """Распознавание речи. Пока доступно только через Groq Whisper —
+    это единственный проверенный бесплатный Whisper-совместимый эндпоинт
+    в нашем реестре. Если GROQ_API_KEY не задан — просто вернёт None."""
+    groq_provider = next((p for p in PROVIDERS if p["id"] == "groq"), None)
+    if not groq_provider or not os.getenv(groq_provider["env_key"]):
+        print("[AUDIO] GROQ_API_KEY не задан — распознавание речи недоступно")
+        return None
+
+    client = get_client(groq_provider)
+    for model_name in groq_provider["audio_models"]:
         try:
             with open(file_path, "rb") as file:
-                return groq_client.audio.transcriptions.create(
-                    file=(file_path, file.read()),
+                result = client.audio.transcriptions.create(
+                    file=(os.path.basename(file_path), file.read()),
                     model=model_name,
                     prompt="Распознай русскую речь.",
                     response_format="text",
-                    language="ru"
+                    language="ru",
                 )
+            text = result if isinstance(result, str) else getattr(result, "text", str(result))
+            print(f"[AUDIO] Успешно: {model_name}")
+            return text
         except Exception as e:
-            print(f"[АУДИО] Ошибка {model_name}: {e}")
+            print(f"[AUDIO] Ошибка {model_name}: {e}")
     return None
 
 def clean_answer(text: str) -> str:
-    text = re.sub(r'\*\*\*(.*?)\*\*\*', r'\1', text)
-    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
-    text = re.sub(r'^###\s+', '', text, flags=re.MULTILINE)
-    text = re.sub(r'\*{3,}', '', text)
+    """Убирает лишний Markdown, который часто добавляют модели
+    (***жирный курсив***, **жирный**, ### заголовки, декоративные строки
+    из одних звёздочек), не портя обычный текст."""
+    if not text:
+        return ""
+    text = re.sub(r'\*\*\*(.+?)\*\*\*', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'^\s{0,3}#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*[-*]\s+', '• ', text, flags=re.MULTILINE)
+    text = re.sub(r'\*{2,}', '', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 def send_long_message(chat_id: int, text: str):
+    if not text:
+        return
     max_length = 4000
     for i in range(0, len(text), max_length):
-        bot.send_message(chat_id, text[i:i+max_length])
+        bot.send_message(chat_id, text[i:i + max_length])
 
 # ==========================================
 # 4. ОБРАБОТКА МУЛЬТИМЕДИА
@@ -229,16 +260,15 @@ def process_image(file_info, downloaded_file, file_extension: str) -> Optional[s
         input_path = os.path.join(temp_dir, f"input{file_extension}")
         with open(input_path, 'wb') as f:
             f.write(downloaded_file)
-            
+
         try:
             img = Image.open(input_path)
             if img.mode != 'RGB':
                 img = img.convert('RGB')
-            # Ограничение для матриц Llama 3.2 Vision
             img.thumbnail((1120, 1120))
             output_path = os.path.join(temp_dir, "optimized.jpg")
             img.save(output_path, "JPEG", quality=85)
-            
+
             with open(output_path, "rb") as f:
                 return base64.b64encode(f.read()).decode('utf-8')
         except Exception as e:
@@ -255,12 +285,12 @@ def extract_video_frames(video_path: str, num_frames=6) -> List[str]:
             ]
             result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             duration = float(result.stdout.strip())
-            
+
             if duration <= 0:
                 raise ValueError("Продолжительность 0")
 
             intervals = [duration * i / (num_frames + 1) for i in range(1, num_frames + 1)]
-            
+
             for i, ts in enumerate(intervals):
                 frame_path = os.path.join(temp_dir, f"frame_{i}.jpg")
                 ffmpeg_cmd = [
@@ -268,7 +298,7 @@ def extract_video_frames(video_path: str, num_frames=6) -> List[str]:
                     "-vframes", "1", "-q:v", "2", "-vf", "scale=-1:720", frame_path
                 ]
                 subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                
+
                 if os.path.exists(frame_path):
                     with open(frame_path, "rb") as f:
                         frames_b64.append(base64.b64encode(f.read()).decode('utf-8'))
@@ -281,16 +311,16 @@ def extract_video_frames(video_path: str, num_frames=6) -> List[str]:
 # ==========================================
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "Привет! 👋 Я твой умный ИИ-помощник. Отправь мне текст, голосовое сообщение, картинку или документ, и я с радостью помогу! ✨")
+    bot.reply_to(message, "Привет! 👋 Я твой умный ИИ-помощник. Отправь мне текст, голосовое сообщение, картинку, видео или документ, и я с радостью помогу! ✨")
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     try:
         add_message(message.chat.id, "user", message.text)
         bot.send_chat_action(message.chat.id, 'typing')
-        
+
         answer = generate_response(message.chat.id)
-        
+
         add_message(message.chat.id, "assistant", answer)
         send_long_message(message.chat.id, answer)
     except Exception as e:
@@ -303,7 +333,7 @@ def handle_photo(message):
         bot.send_chat_action(message.chat.id, 'upload_photo')
         file_info = bot.get_file(message.photo[-1].file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        
+
         b64_image = process_image(file_info, downloaded_file, ".jpg")
         if not b64_image:
             bot.reply_to(message, "Не могу прочитать эту картинку 😔 Возможно, файл поврежден.")
@@ -311,12 +341,12 @@ def handle_photo(message):
 
         prompt_text = message.caption if message.caption else "Посмотри на эту картинку и расскажи подробно, что на ней изображено."
         add_message(message.chat.id, "user", f"[Отправлена картинка] {message.caption or ''}")
-        
+
         answer = generate_vision_response(message.chat.id, prompt_text, [b64_image])
-        
+
         add_message(message.chat.id, "assistant", answer)
         send_long_message(message.chat.id, answer)
-        
+
     except Exception as e:
         print(f"[ОШИБКА] Фото: {e}")
         bot.reply_to(message, "Произошла ошибка при загрузке фото 💔")
@@ -328,26 +358,26 @@ def handle_audio(message):
         file_id = message.voice.file_id if message.content_type == 'voice' else message.audio.file_id
         file_info = bot.get_file(file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        
+
         ext = os.path.splitext(file_info.file_path)[1] or ".ogg"
-        
+
         with tempfile.TemporaryDirectory() as temp_dir:
             audio_path = os.path.join(temp_dir, f"audio{ext}")
             with open(audio_path, 'wb') as f:
                 f.write(downloaded_file)
-            
+
             bot.reply_to(message, "🎙️ Слушаю твое голосовое сообщение... 🎧")
             transcribed_text = transcribe_audio(audio_path)
-            
+
             if not transcribed_text:
                 bot.reply_to(message, "Не расслышал... 🙉 Что-то не так с аудио, попробуй записать еще раз!")
                 return
-                
+
             add_message(message.chat.id, "user", f"[Голосовое]: {transcribed_text}")
             answer = generate_response(message.chat.id)
-            
+
             add_message(message.chat.id, "assistant", answer)
-            send_long_message(message.chat.id, f"📝 *Ты сказал(а):* _{transcribed_text}_\n\n{answer}")
+            send_long_message(message.chat.id, f"📝 Ты сказал(а): {transcribed_text}\n\n{answer}")
 
     except Exception as e:
         print(f"[ОШИБКА] Аудио: {e}")
@@ -368,41 +398,44 @@ def handle_document_and_video(message):
             bot.send_chat_action(message.chat.id, 'upload_document')
 
         if file_size > 20 * 1024 * 1024:
-            bot.reply_to(message, "Ого, какой большой файл! 😲 Телеграм разрешает качать файлы только до 20 МБ. Попробуй сжать его.")
+            bot.reply_to(message, "Ого, какой большой файл! 😲 Телеграм разрешает боту скачивать файлы только до 20 МБ. Файл слишком большой для полной обработки — попробуй сжать его.")
             return
 
         ext = os.path.splitext(filename)[1].lower()
         file_info = bot.get_file(file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        
+
         if ext in ['.heic', '.heif']:
             b64_image = process_image(file_info, downloaded_file, ext)
+            if not b64_image:
+                bot.reply_to(message, "Не получилось прочитать это HEIC-фото 😔")
+                return
             prompt_text = message.caption if message.caption else "Что изображено на этом фото?"
             add_message(message.chat.id, "user", f"[HEIC Фото] {message.caption or ''}")
             answer = generate_vision_response(message.chat.id, prompt_text, [b64_image])
             add_message(message.chat.id, "assistant", answer)
             send_long_message(message.chat.id, answer)
             return
-            
+
         video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.mpeg', '.mpg']
         if ext in video_extensions or message.content_type == 'video':
             with tempfile.TemporaryDirectory() as temp_dir:
                 video_path = os.path.join(temp_dir, f"video{ext}")
                 with open(video_path, 'wb') as f:
                     f.write(downloaded_file)
-                
+
                 bot.reply_to(message, "🎥 Видео получено! Смотрю кадры, дай мне пару секунд... 🍿")
                 frames = extract_video_frames(video_path, num_frames=6)
-                
+
                 if not frames:
                     bot.reply_to(message, "Не смог разглядеть кадры в этом видео 🎞️ Возможно, формат не поддерживается.")
                     return
-                    
+
                 prompt_text = message.caption if message.caption else "Посмотри на эти кадры из видео и расскажи, что там происходит."
                 add_message(message.chat.id, "user", f"[Видео: {filename}] {message.caption or ''}")
-                
+
                 answer = generate_vision_response(message.chat.id, prompt_text, frames)
-                
+
                 add_message(message.chat.id, "assistant", answer)
                 send_long_message(message.chat.id, answer)
             return
@@ -411,15 +444,15 @@ def handle_document_and_video(message):
             file_path = os.path.join(temp_dir, filename)
             with open(file_path, 'wb') as f:
                 f.write(downloaded_file)
-                
+
             bot.reply_to(message, "📄 Читаю документ, секундочку... 🧐")
             extracted_text = parse_file(file_path, filename)
-            
+
             instruction = message.caption if message.caption else "Прочитай этот документ и выдели главную мысль."
             add_message(message.chat.id, "user", f"[Документ: {filename}]\nЗапрос: {instruction}\n\nТекст:\n{extracted_text}")
-            
+
             answer = generate_response(message.chat.id)
-            
+
             add_message(message.chat.id, "assistant", answer)
             send_long_message(message.chat.id, answer)
 
@@ -431,35 +464,69 @@ def handle_document_and_video(message):
 # 6. ЖИЗНЕННЫЙ ЦИКЛ ПОДКЛЮЧЕНИЯ И ЗАПУСК
 # ==========================================
 def check_telegram_token():
+    print("[TELEGRAM] Проверка токена...")
     try:
         me = bot.get_me()
+        print(f"[TELEGRAM] Бот авторизован: @{me.username}")
         bot.remove_webhook()
+        print("[TELEGRAM] Webhook удалён (если был установлен)")
         return True
+    except ApiTelegramException as e:
+        if e.error_code == 401:
+            print("[ФАТАЛЬНО] 401 Unauthorized — BOT_TOKEN неверный или отозван.")
+        else:
+            print(f"[ФАТАЛЬНО] Ошибка Telegram API при проверке токена: {e}")
+        return False
     except Exception as e:
         print(f"[ФАТАЛЬНО] Ошибка токена: {e}")
         return False
 
 def main():
+    global TEXT_CHAIN, VISION_CHAIN
+
     if not check_telegram_token():
         return
-        
+
+    print("[AI] Строю цепочку текстовых моделей...")
+    TEXT_CHAIN = build_chain("text_models")
+    print("[AI] Строю цепочку vision-моделей...")
+    VISION_CHAIN = build_chain("vision_models")
+
+    if not TEXT_CHAIN:
+        print("[КРИТИЧЕСКАЯ ОШИБКА] Ни один текстовый AI-провайдер не подключён.")
+        print("Задайте хотя бы одну из переменных окружения: " +
+              ", ".join(p["env_key"] for p in PROVIDERS if p.get("text_models")))
+        return
+
+    if not VISION_CHAIN:
+        missing = describe_missing("vision_models")
+        print("[AI] ВНИМАНИЕ: ни один vision-провайдер не подключён — фото/видео/HEIC отвечать не смогут.")
+        if missing:
+            print("[AI] Можно подключить для зрения: " + ", ".join(missing))
+
     load_histories()
-    
+    print("[START] Fast Answer bot")
+
     while True:
         try:
             bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
         except ApiTelegramException as e:
             if e.error_code == 409:
+                print("[TELEGRAM] 409 Conflict: похоже, где-то ещё запущен второй экземпляр бота с этим же BOT_TOKEN. Жду 15 секунд...")
                 time.sleep(15)
             elif e.error_code == 401:
+                print("[ФАТАЛЬНО] 401 Unauthorized во время polling — токен стал недействителен. Останавливаюсь.")
                 break
             elif e.error_code == 429:
+                print("[TELEGRAM] 429 Too Many Requests. Жду 30 секунд...")
                 time.sleep(30)
             else:
+                print(f"[TELEGRAM] Ошибка API ({e.error_code}): {e}")
                 time.sleep(5)
         except httpx.ReadTimeout:
-             time.sleep(3)
+            time.sleep(3)
         except Exception as e:
+            print(f"[TELEGRAM] Непредвиденная ошибка polling: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
