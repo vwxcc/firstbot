@@ -81,17 +81,9 @@ MAX_OUTPUT_TOKENS = int(
 )
 
 
-MODELS = [
-    "cheapvibecode/claude-fable-5",
-    "cheapvibecode/claude-opus-5",
-    "cheapvibecode/claude-sonnet-5",
-]
-
-MODEL_NAMES = {
-    "cheapvibecode/claude-fable-5": "Claude Fable 5",
-    "cheapvibecode/claude-opus-5": "Claude Opus 5",
-    "cheapvibecode/claude-sonnet-5": "Claude Sonnet 5",
-}
+# Only Claude Sonnet 5 is used
+SINGLE_MODEL = "cheapvibecode/claude-sonnet-5"
+SINGLE_MODEL_NAME = "Claude Sonnet 5"
 
 
 # ============================================================
@@ -280,7 +272,7 @@ def ensure_user(message):
         user.id,
         user.username or "",
         user.first_name or "",
-        MODELS[2],
+        SINGLE_MODEL,
         now,
         now
     ))
@@ -290,39 +282,13 @@ def ensure_user(message):
 
 
 def get_model(user_id):
-    conn = db()
-
-    row = conn.execute(
-        "SELECT model FROM users WHERE user_id=?",
-        (user_id,)
-    ).fetchone()
-
-    conn.close()
-
-    if not row:
-        return MODELS[2]
-
-    model = row["model"]
-
-    if model not in MODELS:
-        return MODELS[2]
-
-    return model
+    # Always return the single Sonnet 5 model
+    return SINGLE_MODEL
 
 
 def set_model(user_id, model):
-    if model not in MODELS:
-        return
-
-    conn = db()
-
-    conn.execute(
-        "UPDATE users SET model=?, updated_at=? WHERE user_id=?",
-        (model, int(time.time()), user_id)
-    )
-
-    conn.commit()
-    conn.close()
+    # Ignore model selection - always use Sonnet 5
+    pass
 
 
 # ============================================================
@@ -649,6 +615,7 @@ async def api_request(
     messages,
     max_tokens=MAX_OUTPUT_TOKENS
 ):
+    # Always use Sonnet 5 regardless of model parameter
     url = f"{API_BASE}/chat/completions"
 
     headers = {
@@ -658,7 +625,7 @@ async def api_request(
     }
 
     payload = {
-        "model": model,
+        "model": SINGLE_MODEL,
         "messages": messages,
         "max_tokens": max_tokens,
     }
@@ -791,11 +758,9 @@ def compress_history(user_id):
         }
     ]
 
-    summary_model = MODELS[0]
-
     try:
         summary, tokens = run_api(
-            summary_model,
+            SINGLE_MODEL,
             messages,
             max_tokens=1500
         )
@@ -856,18 +821,8 @@ def maybe_compress(user_id):
 
 
 # ============================================================
-# MODEL FALLBACK
+# GENERATE ANSWER (No fallback, only Sonnet 5)
 # ============================================================
-
-def available_models_for_fallback(selected):
-    result = [selected]
-
-    for model in MODELS:
-        if model not in result:
-            result.append(model)
-
-    return result
-
 
 def generate_answer(user_id, user_text, attachments=None):
     attachments = attachments or []
@@ -913,79 +868,60 @@ def generate_answer(user_id, user_text, attachments=None):
         "content": user_content
     })
 
-    selected_model = get_model(user_id)
+    try:
+        logger.info(
+            "Запрос: user=%s model=%s",
+            user_id,
+            SINGLE_MODEL
+        )
 
-    errors = []
+        answer, tokens = run_api(
+            SINGLE_MODEL,
+            messages
+        )
 
-    for model in available_models_for_fallback(
-        selected_model
-    ):
-        try:
-            logger.info(
-                "Запрос: user=%s model=%s",
-                user_id,
-                model
+        if not tokens:
+            tokens = (
+                estimate_tokens(user_content)
+                + estimate_tokens(answer)
             )
 
-            answer, tokens = run_api(
-                model,
-                messages
-            )
+        add_usage(
+            user_id,
+            tokens
+        )
 
-            if not tokens:
-                tokens = (
-                    estimate_tokens(user_content)
-                    + estimate_tokens(answer)
-                )
+        add_message(
+            user_id,
+            "user",
+            user_content
+        )
 
-            add_usage(
-                user_id,
-                tokens
-            )
+        add_message(
+            user_id,
+            "assistant",
+            answer
+        )
 
-            add_message(
-                user_id,
-                "user",
-                user_content
-            )
+        maybe_compress(user_id)
 
-            add_message(
-                user_id,
-                "assistant",
-                answer
-            )
+        return clean_answer(answer), SINGLE_MODEL
 
-            maybe_compress(user_id)
+    except Exception as e:
+        error_text = str(e)
 
-            return clean_answer(answer), model
+        logger.error(
+            "Ошибка запроса для user=%s: %s",
+            user_id,
+            error_text
+        )
 
-        except Exception as e:
-            error_text = str(e)
-
-            logger.error(
-                "Ошибка модели %s для user=%s: %s",
-                model,
-                user_id,
-                error_text
-            )
-
-            errors.append(
-                f"{model}: {error_text}"
-            )
-
-            continue
-
-    logger.error(
-        "Все модели завершились ошибкой:\n%s",
-        "\n".join(errors)
-    )
-
-    return (
-        "Небольшая техническая проблема: сейчас не удалось "
-        "получить ответ. Попробуй отправить запрос ещё раз через "
-        "несколько секунд.",
-        None
-    )
+        return (
+            "Небольшая техническая проблема: сейчас не удалось "
+            "получить ответ. Попробуй отправить запрос ещё раз через "
+            "несколько секунд.",
+            None
+        )
 
 
 # ============================================================
@@ -1019,14 +955,13 @@ def safe_send(chat_id, text):
 
 def model_keyboard():
     keyboard = types.InlineKeyboardMarkup()
-
-    for model in MODELS:
-        keyboard.add(
-            types.InlineKeyboardButton(
-                MODEL_NAMES[model],
-                callback_data=f"model:{model}"
-            )
+    
+    keyboard.add(
+        types.InlineKeyboardButton(
+            SINGLE_MODEL_NAME,
+            callback_data="model:only"
         )
+    )
 
     return keyboard
 
@@ -1037,7 +972,6 @@ def main_keyboard():
     )
 
     keyboard.row(
-        types.KeyboardButton("🤖 Модель"),
         types.KeyboardButton("📊 Лимит")
     )
 
@@ -1056,14 +990,10 @@ def main_keyboard():
 def start(message):
     ensure_user(message)
 
-    model = get_model(
-        message.from_user.id
-    )
-
     text = (
         "🚀 Fast Answer\n\n"
-        "Я AI-бот с поддержкой Claude.\n\n"
-        f"Текущая модель: {MODEL_NAMES.get(model, model)}\n\n"
+        "Я AI-бот с поддержкой Claude Sonnet 5.\n\n"
+        f"Модель: {SINGLE_MODEL_NAME}\n\n"
         "Можно отправлять:\n"
         "• текст\n"
         "• фото\n"
@@ -1076,7 +1006,6 @@ def start(message):
         "• HEIC/HEIF\n"
         "• видео и MOV\n\n"
         "Основные команды:\n"
-        "/model — выбрать модель\n"
         "/limit — посмотреть лимит\n"
         "/new — начать новый диалог\n"
         "/help — помощь"
@@ -1099,7 +1028,6 @@ def help_command(message):
 
     text = (
         "📖 Возможности\n\n"
-        "/model — переключение Claude\n"
         "/limit — состояние лимита\n"
         "/new — очистить текущую историю\n"
         "/help — список команд\n\n"
@@ -1113,68 +1041,6 @@ def help_command(message):
     bot.send_message(
         message.chat.id,
         text
-    )
-
-
-# ============================================================
-# /MODEL
-# ============================================================
-
-@bot.message_handler(commands=["model"])
-def model_command(message):
-    ensure_user(message)
-
-    current = get_model(
-        message.from_user.id
-    )
-
-    bot.send_message(
-        message.chat.id,
-        "Выбери модель:\n\n"
-        f"Сейчас: {MODEL_NAMES.get(current, current)}",
-        reply_markup=model_keyboard()
-    )
-
-
-# ============================================================
-# MODEL CALLBACK
-# ============================================================
-
-@bot.callback_query_handler(
-    func=lambda call: call.data.startswith("model:")
-)
-def model_callback(call):
-    user_id = call.from_user.id
-
-    ensure_user(call.message)
-
-    model = call.data.split(
-        "model:",
-        1
-    )[1]
-
-    if model not in MODELS:
-        bot.answer_callback_query(
-            call.id,
-            "Неизвестная модель"
-        )
-        return
-
-    set_model(
-        user_id,
-        model
-    )
-
-    bot.answer_callback_query(
-        call.id,
-        "Модель переключена"
-    )
-
-    bot.edit_message_text(
-        "✅ Модель изменена.\n\n"
-        f"Текущая модель: {MODEL_NAMES[model]}",
-        call.message.chat.id,
-        call.message.message_id
     )
 
 
@@ -1669,58 +1535,50 @@ def handle_photo(message):
             "content": content
         })
 
-        selected = get_model(
-            message.from_user.id
-        )
+        try:
+            answer, tokens = run_api(
+                SINGLE_MODEL,
+                messages
+            )
 
-        for model in available_models_for_fallback(
-            selected
-        ):
-            try:
-                answer, tokens = run_api(
-                    model,
-                    messages
-                )
+            if not tokens:
+                tokens = estimate_tokens(
+                    user_text
+                ) + estimate_tokens(answer)
 
-                if not tokens:
-                    tokens = estimate_tokens(
-                        user_text
-                    ) + estimate_tokens(answer)
+            add_usage(
+                message.from_user.id,
+                tokens
+            )
 
-                add_usage(
-                    message.from_user.id,
-                    tokens
-                )
+            add_message(
+                message.from_user.id,
+                "user",
+                user_text + "\n[Изображение]"
+            )
 
-                add_message(
-                    message.from_user.id,
-                    "user",
-                    user_text + "\n[Изображение]"
-                )
+            add_message(
+                message.from_user.id,
+                "assistant",
+                answer
+            )
 
-                add_message(
-                    message.from_user.id,
-                    "assistant",
-                    answer
-                )
+            maybe_compress(
+                message.from_user.id
+            )
 
-                maybe_compress(
-                    message.from_user.id
-                )
+            safe_send(
+                message.chat.id,
+                answer
+            )
 
-                safe_send(
-                    message.chat.id,
-                    answer
-                )
+            return
 
-                return
-
-            except Exception as e:
-                logger.error(
-                    "Ошибка vision модели %s: %s",
-                    model,
-                    e
-                )
+        except Exception as e:
+            logger.error(
+                "Ошибка vision модели: %s",
+                e
+            )
 
         bot.reply_to(
             message,
@@ -1796,10 +1654,6 @@ def handle_text(message):
         return
 
     if text.startswith("/"):
-        return
-
-    if text == "🤖 Модель":
-        model_command(message)
         return
 
     if text == "📊 Лимит":
@@ -1881,8 +1735,8 @@ def main():
     )
 
     logger.info(
-        "Models: %s",
-        ", ".join(MODELS)
+        "Модель: %s",
+        SINGLE_MODEL
     )
 
     logger.info(
