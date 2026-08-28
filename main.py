@@ -81,9 +81,9 @@ MAX_OUTPUT_TOKENS = int(
 )
 
 
-# Only Claude Sonnet 5 is used
-SINGLE_MODEL = "cheapvibecode/claude-sonnet-5"
-SINGLE_MODEL_NAME = "Claude Sonnet 5"
+# Only Claude Haiku is used
+SINGLE_MODEL = "cheapvibecode/claude-haiku"
+SINGLE_MODEL_NAME = "Claude Haiku"
 
 
 # ============================================================
@@ -282,12 +282,12 @@ def ensure_user(message):
 
 
 def get_model(user_id):
-    # Always return the single Sonnet 5 model
+    # Always return the single Haiku model
     return SINGLE_MODEL
 
 
 def set_model(user_id, model):
-    # Ignore model selection - always use Sonnet 5
+    # Ignore model selection - always use Haiku
     pass
 
 
@@ -615,7 +615,7 @@ async def api_request(
     messages,
     max_tokens=MAX_OUTPUT_TOKENS
 ):
-    # Always use Sonnet 5 regardless of model parameter
+    # Always use Haiku regardless of model parameter
     url = f"{API_BASE}/chat/completions"
 
     headers = {
@@ -821,7 +821,7 @@ def maybe_compress(user_id):
 
 
 # ============================================================
-# GENERATE ANSWER (No fallback, only Sonnet 5)
+# GENERATE ANSWER (No fallback, only Haiku)
 # ============================================================
 
 def generate_answer(user_id, user_text, attachments=None):
@@ -992,7 +992,7 @@ def start(message):
 
     text = (
         "🚀 Fast Answer\n\n"
-        "Я AI-бот с поддержкой Claude Sonnet 5.\n\n"
+        "Я AI-бот с поддержкой Claude Haiku.\n\n"
         f"Модель: {SINGLE_MODEL_NAME}\n\n"
         "Можно отправлять:\n"
         "• текст\n"
